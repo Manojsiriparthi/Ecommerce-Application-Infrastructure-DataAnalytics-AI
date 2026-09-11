@@ -1,0 +1,15 @@
+node_modules/
+.next/
+out/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+.terraform/
+*.tfstate
+*.tfstate.*
+.DS_Store
+.vscode/
+.idea/
