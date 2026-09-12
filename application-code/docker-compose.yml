@@ -1,0 +1,165 @@
+services:
+
+  # =========================
+  # FRONTEND
+  # =========================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USER_API: http://13.232.24.76:4001
+        NEXT_PUBLIC_PRODUCT_API: http://13.232.24.76:4002
+        NEXT_PUBLIC_CART_API: http://13.232.24.76:4003
+        NEXT_PUBLIC_ORDER_API: http://13.232.24.76:4004
+        NEXT_PUBLIC_PAYMENT_API: http://13.232.24.76:4005
+    container_name: ecommerce-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+    depends_on:
+      - user-service
+      - product-service
+      - cart-service
+      - order-service
+      - payment-service
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # USER SERVICE
+  # =========================
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-user-service
+    ports:
+      - "4001:4001"
+    environment:
+      NODE_ENV: production
+      PORT: 4001
+      DATABASE_URL: ${USER_DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      AWS_REGION: ${AWS_REGION}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN}
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # PRODUCT SERVICE
+  # =========================
+  product-service:
+    build:
+      context: ./services/product-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-product-service
+    ports:
+      - "4002:4002"
+    environment:
+      NODE_ENV: production
+      PORT: 4002
+      DATABASE_URL: ${PRODUCT_DATABASE_URL}
+      AWS_REGION: ${AWS_REGION}
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # CART SERVICE
+  # =========================
+  cart-service:
+    build:
+      context: ./services/cart-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-cart-service
+    ports:
+      - "4003:4003"
+    environment:
+      NODE_ENV: production
+      PORT: 4003
+      DATABASE_URL: ${CART_DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # ORDER SERVICE
+  # =========================
+  order-service:
+    build:
+      context: ./services/order-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-order-service
+    ports:
+      - "4004:4004"
+    environment:
+      NODE_ENV: production
+      PORT: 4004
+      DATABASE_URL: ${ORDER_DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      PAYMENT_SERVICE_URL: http://payment-service:4005
+      NOTIFICATION_SERVICE_URL: http://notification-service:4006
+    depends_on:
+      - payment-service
+      - notification-service
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # PAYMENT SERVICE
+  # =========================
+  payment-service:
+    build:
+      context: ./services/payment-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-payment-service
+    ports:
+      - "4005:4005"
+    environment:
+      NODE_ENV: production
+      PORT: 4005
+      DATABASE_URL: ${PAYMENT_DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+  # =========================
+  # NOTIFICATION SERVICE
+  # =========================
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: ecommerce-notification-service
+    ports:
+      - "4006:4006"
+    environment:
+      NODE_ENV: production
+      PORT: 4006
+      AWS_REGION: ${AWS_REGION}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL}
+    restart: unless-stopped
+    networks:
+      - ecommerce-network
+
+
+# =========================
+# DOCKER NETWORK
+# =========================
+networks:
+  ecommerce-network:
+    driver: bridge
