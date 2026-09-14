@@ -266,7 +266,7 @@ phases:
       # SonarQube can auto-create the project when the token has the
       # required project-creation permission. Otherwise create the project
       # once in SonarQube with the key below.
-      - echo "🔎 SonarQube project key: ${SONAR_PROJECT_KEY}"
+      - 'echo "🔎 SonarQube project key: ${SONAR_PROJECT_KEY}"'
 
       # Use SonarSource's official scanner image. Pinning the scanner
       # major version avoids silently changing scanner behavior.
