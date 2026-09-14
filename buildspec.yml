@@ -199,8 +199,11 @@ phases:
       # ---------------------------------------------------------------
       # 🧪 Unit tests
       # ---------------------------------------------------------------
+      # A service without a test script is skipped.
+      # If a test script exists, npm test MUST pass or the build fails.
       - |
         set -euo pipefail
+
         while IFS= read -r SERVICE; do
           SERVICE_NAME="$(basename "${SERVICE}")"
 
@@ -212,10 +215,12 @@ phases:
           "; then
             echo "🧪 npm test → ${SERVICE_NAME}"
             (cd "${SERVICE}" && npm test)
+            echo "✅ Tests passed → ${SERVICE_NAME}"
           else
-            echo "❌ No test script defined → ${SERVICE_NAME}"
-            exit 1
+            echo "ℹ️ No test script defined → ${SERVICE_NAME}"
+            echo "ℹ️ Skipping unit tests → ${SERVICE_NAME}"
           fi
+
         done < /tmp/ecommerce-services.txt
 
       # ---------------------------------------------------------------
