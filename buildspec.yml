@@ -1,0 +1,1594 @@
+# =====================================================================
+# 🚀 E-COMMERCE — CENTRALIZED DEVSECOPS CI PIPELINE
+# =====================================================================
+#
+# FLOW:
+#
+# GitHub
+#   ↓
+# CodePipeline
+#   ↓
+# CodeBuild
+#   ↓
+# npm CI / Build / Unit Test / Integration Test
+#   ↓
+# SonarQube SAST + Quality Gate
+#   ↓
+# Docker Build
+#   ↓
+# Trivy Container Scan
+#   ↓
+# ECR Push
+#   ↓
+# ECR Scan-on-Push
+#   ↓
+# SBOM Generation
+#   ↓
+# Immutable Image Digest
+#   ↓
+# ECS Deployment Artifacts
+#
+# =====================================================================
+# 🏗️ DESIGN PRINCIPLES
+# =====================================================================
+#
+# 1. No git clone inside CodeBuild.
+#    CodePipeline already provides the GitHub source artifact.
+#
+# 2. Services are discovered dynamically.
+#
+#    application-code/
+#    ├── frontend/
+#    └── services/
+#        ├── user-service/
+#        ├── product-service/
+#        ├── cart-service/
+#        └── ...
+#
+# 3. A new backend service only needs:
+#
+#    package.json
+#    package-lock.json
+#    Dockerfile
+#
+# 4. ECR repositories are created automatically using:
+#
+#    ecommerce-<service-name>
+#
+# 5. Docker images are built only once.
+#
+# 6. The same image is pushed after security validation.
+#
+# 7. CRITICAL vulnerabilities fail the pipeline.
+#
+# 8. Trivy reports, ECR reports, SBOMs and release metadata
+#    are stored as CodePipeline artifacts.
+#
+# =====================================================================
+
+
+version: 0.2
+
+
+# =====================================================================
+# 🌍 ENVIRONMENT CONFIGURATION
+# =====================================================================
+
+env:
+
+  variables:
+
+    # -----------------------------------------------------------------
+    # AWS Configuration
+    # -----------------------------------------------------------------
+
+    AWS_REGION: "ap-south-1"
+    AWS_ACCOUNT_ID: "153099270680"
+
+    # -----------------------------------------------------------------
+    # SonarQube Configuration
+    # -----------------------------------------------------------------
+
+    SONAR_HOST_URL: "http://13.232.24.76:9000"
+
+    SONAR_PROJECT_KEY: "ecommerce-application"
+    SONAR_PROJECT_NAME: "Ecommerce Application"
+
+    # -----------------------------------------------------------------
+    # SNS Notification Topic
+    # -----------------------------------------------------------------
+
+    SNS_TOPIC_ARN: "arn:aws:sns:ap-south-1:153099270680:tetris-build-notifications"
+
+    # -----------------------------------------------------------------
+    # Trivy Version
+    # -----------------------------------------------------------------
+
+    TRIVY_VERSION: "0.56.2"
+
+    # -----------------------------------------------------------------
+    # Release Version
+    #
+    # DEV default:
+    #
+    # v0.1.<CodeBuildNumber>-dev
+    #
+    # Example:
+    #
+    # v0.1.25-dev
+    #
+    # For controlled releases, RELEASE_VERSION can be overridden
+    # from CodeBuild / CodePipeline.
+    # -----------------------------------------------------------------
+
+    RELEASE_VERSION: ""
+
+
+  # ===================================================================
+  # 🔐 SECRETS MANAGER
+  # ===================================================================
+  #
+  # Secret:
+  #
+  #   sonarqube_token
+  #
+  # JSON key:
+  #
+  #   Sonar_token
+  #
+  # The actual token is NOT stored in this buildspec.
+  #
+  # ===================================================================
+
+  secrets-manager:
+
+    SONAR_TOKEN: "sonarqube_token:Sonar_token"
+
+
+# =====================================================================
+# 🔄 BUILD PHASES
+# =====================================================================
+
+phases:
+
+
+  # ===================================================================
+  # 📦 1. INSTALL
+  # ===================================================================
+  #
+  # Install / verify:
+  #
+  # - Node.js
+  # - npm
+  # - Docker
+  # - AWS CLI
+  # - Trivy
+  #
+  # ===================================================================
+
+  install:
+
+    runtime-versions:
+
+      nodejs: 20
+
+    commands:
+
+      - echo "📦 Preparing centralized DevSecOps toolchain..."
+
+      - echo "🔎 Node.js version:"
+      - node --version
+
+      - echo "🔎 npm version:"
+      - npm --version
+
+      - echo "🔎 Docker version:"
+      - docker --version
+
+      - echo "🔎 AWS CLI version:"
+      - aws --version
+
+      - echo "🛡️ Pulling Trivy ${TRIVY_VERSION}..."
+
+      - docker pull "aquasec/trivy:${TRIVY_VERSION}"
+
+
+  # ===================================================================
+  # 🔎 2. PRE-BUILD
+  # ===================================================================
+  #
+  # Flow:
+  #
+  # Discover
+  #   ↓
+  # Validate
+  #   ↓
+  # npm ci
+  #   ↓
+  # Application Build
+  #   ↓
+  # Unit Tests
+  #   ↓
+  # Integration Tests
+  #   ↓
+  # SonarQube
+  #   ↓
+  # ECR Login
+  #
+  # ===================================================================
+
+  pre_build:
+
+    commands:
+
+
+      # ===============================================================
+      # 🔧 Initialize Build Variables
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        export RELEASE_VERSION="${RELEASE_VERSION:-v0.1.${CODEBUILD_BUILD_NUMBER}-dev}"
+
+        export COMMIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+
+        export REPORT_ROOT="${CODEBUILD_SRC_DIR}/reports"
+
+        export SCAN_ROOT="${REPORT_ROOT}/container-scan"
+
+        export SBOM_ROOT="${REPORT_ROOT}/sbom"
+
+        export METADATA_ROOT="${REPORT_ROOT}/metadata"
+
+        mkdir -p \
+          "${SCAN_ROOT}" \
+          "${SBOM_ROOT}" \
+          "${METADATA_ROOT}" \
+          "${CODEBUILD_SRC_DIR}/artifacts/ecs"
+
+        echo "=============================================================="
+        echo "🏷️ Release Version : ${RELEASE_VERSION}"
+        echo "🔐 Commit SHA      : ${COMMIT_SHA}"
+        echo "🏗️ CodeBuild       : ${CODEBUILD_BUILD_NUMBER}"
+        echo "🌍 AWS Region      : ${AWS_REGION}"
+        echo "📦 ECR Registry    : ${ECR_REGISTRY}"
+        echo "=============================================================="
+
+
+      # ===============================================================
+      # 🔎 Discover Frontend + Backend Microservices
+      # ===============================================================
+      #
+      # Frontend:
+      #
+      #   application-code/frontend
+      #
+      # Backend:
+      #
+      #   application-code/services/*
+      #
+      # No service names are hardcoded.
+      #
+      # If a new service is added:
+      #
+      #   application-code/services/chat-service/
+      #
+      # the pipeline automatically discovers it.
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        SERVICES=()
+
+
+        # -------------------------------------------------------------
+        # Discover Frontend
+        # -------------------------------------------------------------
+
+        if [ -f "application-code/frontend/package.json" ]; then
+
+          SERVICES+=("application-code/frontend")
+
+        fi
+
+
+        # -------------------------------------------------------------
+        # Discover Backend Microservices
+        # -------------------------------------------------------------
+
+        if [ -d "application-code/services" ]; then
+
+          while IFS= read -r SERVICE; do
+
+            SERVICES+=("${SERVICE}")
+
+          done < <(
+            find application-code/services \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              | sort
+          )
+
+        fi
+
+
+        # -------------------------------------------------------------
+        # Make Sure At Least One Service Exists
+        # -------------------------------------------------------------
+
+        if [ "${#SERVICES[@]}" -eq 0 ]; then
+
+          echo "❌ No application services discovered."
+
+          exit 1
+
+        fi
+
+
+        # -------------------------------------------------------------
+        # Save Discovered Services
+        # -------------------------------------------------------------
+
+        printf '%s\n' "${SERVICES[@]}" \
+          > /tmp/ecommerce-services.txt
+
+
+        # -------------------------------------------------------------
+        # Display Services
+        # -------------------------------------------------------------
+
+        echo ""
+        echo "=============================================================="
+        echo "🔎 DISCOVERED APPLICATION SERVICES"
+        echo "=============================================================="
+
+        cat /tmp/ecommerce-services.txt
+
+        echo "=============================================================="
+
+
+      # ===============================================================
+      # ✅ Validate Standard Microservice Contract
+      # ===============================================================
+      #
+      # Every service must contain:
+      #
+      #   package.json
+      #   package-lock.json
+      #   Dockerfile
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          echo ""
+          echo "🔎 Validating service: ${SERVICE_NAME}"
+
+
+          # -----------------------------------------------------------
+          # package.json
+          # -----------------------------------------------------------
+
+          if [ ! -f "${SERVICE}/package.json" ]; then
+
+            echo "❌ Missing package.json: ${SERVICE}"
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------------
+          # package-lock.json
+          # -----------------------------------------------------------
+
+          if [ ! -f "${SERVICE}/package-lock.json" ]; then
+
+            echo "❌ Missing package-lock.json: ${SERVICE}"
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------------
+          # Dockerfile
+          # -----------------------------------------------------------
+
+          if [ ! -f "${SERVICE}/Dockerfile" ]; then
+
+            echo "❌ Missing Dockerfile: ${SERVICE}"
+
+            exit 1
+
+          fi
+
+
+          echo "✅ ${SERVICE_NAME} contract validation passed."
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # ===============================================================
+      # 📦 npm ci — Deterministic Dependency Installation
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          echo ""
+          echo "=============================================================="
+          echo "📦 Installing dependencies: ${SERVICE_NAME}"
+          echo "=============================================================="
+
+          (
+            cd "${SERVICE}"
+
+            npm ci
+          )
+
+          echo "✅ npm ci completed: ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # ===============================================================
+      # 🏗️ Application Build
+      # ===============================================================
+      #
+      # Every discovered service must have:
+      #
+      #   npm run build
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+
+          # -----------------------------------------------------------
+          # Check build script
+          # -----------------------------------------------------------
+
+          if node -e "
+            const packageJson = require('./${SERVICE}/package.json');
+            process.exit(
+              packageJson.scripts && packageJson.scripts.build
+                ? 0
+                : 1
+            );
+          "; then
+
+            echo ""
+            echo "🏗️ Building: ${SERVICE_NAME}"
+
+            (
+              cd "${SERVICE}"
+
+              npm run build
+            )
+
+            echo "✅ Build completed: ${SERVICE_NAME}"
+
+          else
+
+            echo "❌ No build script defined: ${SERVICE}"
+
+            exit 1
+
+          fi
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # ===============================================================
+      # 🧪 Unit Tests
+      # ===============================================================
+      #
+      # Every service must have:
+      #
+      #   npm test
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+
+          # -----------------------------------------------------------
+          # Check test script
+          # -----------------------------------------------------------
+
+          if node -e "
+            const packageJson = require('./${SERVICE}/package.json');
+            process.exit(
+              packageJson.scripts && packageJson.scripts.test
+                ? 0
+                : 1
+            );
+          "; then
+
+            echo ""
+            echo "🧪 Running unit tests: ${SERVICE_NAME}"
+
+            (
+              cd "${SERVICE}"
+
+              npm test
+            )
+
+            echo "✅ Unit tests passed: ${SERVICE_NAME}"
+
+          else
+
+            echo "❌ No test script defined: ${SERVICE}"
+
+            exit 1
+
+          fi
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # ===============================================================
+      # 🔗 Integration Tests
+      # ===============================================================
+      #
+      # Services can optionally define:
+      #
+      #   "test:integration"
+      #
+      # If the script exists, it is executed automatically.
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        INTEGRATION_FOUND=false
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+
+          # -----------------------------------------------------------
+          # Check integration test script
+          # -----------------------------------------------------------
+
+          if node -e "
+            const packageJson = require('./${SERVICE}/package.json');
+            process.exit(
+              packageJson.scripts &&
+              packageJson.scripts['test:integration']
+                ? 0
+                : 1
+            );
+          "; then
+
+            INTEGRATION_FOUND=true
+
+            echo ""
+            echo "🔗 Running integration tests: ${SERVICE_NAME}"
+
+            (
+              cd "${SERVICE}"
+
+              npm run test:integration
+            )
+
+            echo "✅ Integration tests passed: ${SERVICE_NAME}"
+
+          fi
+
+        done < /tmp/ecommerce-services.txt
+
+
+        # -------------------------------------------------------------
+        # No Integration Tests Found
+        # -------------------------------------------------------------
+
+        if [ "${INTEGRATION_FOUND}" = false ]; then
+
+          echo ""
+          echo "ℹ️ No service-level test:integration script found."
+
+          echo "ℹ️ Add test:integration to the relevant package.json"
+          echo "ℹ️ when integration tests are introduced."
+
+        fi
+
+
+      # =================================================================
+      # 🔍 3. SONARQUBE — SAST + QUALITY GATE
+      # =================================================================
+
+      - echo "=============================================================="
+      - echo "🔍 RUNNING SONARQUBE SAST"
+      - echo "=============================================================="
+
+
+      # ===============================================================
+      # 🔐 Verify SonarQube Token
+      # ===============================================================
+      #
+      # Secrets Manager:
+      #
+      #   sonarqube_token
+      #
+      # JSON key:
+      #
+      #   Sonar_token
+      #
+      # CodeBuild exposes it as:
+      #
+      #   SONAR_TOKEN
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        if [ -z "${SONAR_TOKEN:-}" ]; then
+
+          echo "❌ SONAR_TOKEN is not available."
+
+          exit 1
+
+        fi
+
+        echo "✅ SONAR_TOKEN loaded from AWS Secrets Manager."
+
+
+      # ===============================================================
+      # 🔎 Display SonarQube Project
+      # ===============================================================
+
+      - |
+        echo "🔎 SonarQube URL     : ${SONAR_HOST_URL}"
+        echo "🔎 SonarQube Project : ${SONAR_PROJECT_KEY}"
+
+
+      # ===============================================================
+      # 🐳 Pull Official SonarSource Scanner Image
+      # ===============================================================
+      #
+      # Official image:
+      #
+      #   sonarsource/sonar-scanner-cli
+      #
+      # Version:
+      #
+      #   12.1
+      #
+      # ===============================================================
+
+      - |
+        echo "🐳 Pulling SonarSource Scanner..."
+
+        docker pull sonarsource/sonar-scanner-cli:12.1
+
+
+      # ===============================================================
+      # 🔍 Run SonarQube SAST + Quality Gate
+      # ===============================================================
+      #
+      # The entire source repository is mounted into the scanner:
+      #
+      #   ${CODEBUILD_SRC_DIR} → /usr/src
+      #
+      # SonarQube scans:
+      #
+      #   application-code
+      #
+      # Quality Gate is mandatory:
+      #
+      #   sonar.qualitygate.wait=true
+      #
+      # If the Quality Gate fails, CodeBuild fails.
+      #
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        docker run --rm \
+          -e SONAR_HOST_URL="${SONAR_HOST_URL}" \
+          -e SONAR_TOKEN="${SONAR_TOKEN}" \
+          -v "${CODEBUILD_SRC_DIR}:/usr/src" \
+          sonarsource/sonar-scanner-cli:12.1 \
+          -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+          -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+          -Dsonar.projectVersion="${RELEASE_VERSION}" \
+          -Dsonar.sources=application-code \
+          -Dsonar.exclusions="**/node_modules/**,**/.next/**,**/dist/**,**/build/**,**/coverage/**" \
+          -Dsonar.sourceEncoding=UTF-8 \
+          -Dsonar.host.url="${SONAR_HOST_URL}" \
+          -Dsonar.token="${SONAR_TOKEN}" \
+          -Dsonar.qualitygate.wait=true \
+          -Dsonar.qualitygate.timeout=300
+
+
+      # ===============================================================
+      # ✅ SonarQube Gate Passed
+      # ===============================================================
+
+      - |
+        echo "=============================================================="
+        echo "✅ SonarQube SAST completed successfully."
+        echo "✅ SonarQube Quality Gate passed."
+        echo "=============================================================="
+
+
+      # =================================================================
+      # 🔐 4. ECR LOGIN
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "🔐 Logging in to Amazon ECR..."
+
+        aws ecr get-login-password \
+          --region "${AWS_REGION}" \
+          | docker login \
+              --username AWS \
+              --password-stdin \
+              "${ECR_REGISTRY}"
+
+        echo "✅ ECR login successful."
+
+
+  # ===================================================================
+  # 🐳 5. BUILD — Docker Images Built Exactly Once
+  # ===================================================================
+  #
+  # Important:
+  #
+  # Docker images are built once.
+  #
+  # The same images are then:
+  #
+  #   Trivy scanned
+  #       ↓
+  #   ECR pushed
+  #       ↓
+  #   ECR scanned
+  #
+  # This supports immutable promotion DEV → STAGE → PROD.
+  #
+  # ===================================================================
+
+  build:
+
+    commands:
+
+
+      - |
+        echo "=============================================================="
+        echo "🐳 BUILDING APPLICATION CONTAINERS"
+        echo "=============================================================="
+
+
+      # ===============================================================
+      # 🐳 Build Every Discovered Service
+      # ===============================================================
+
+      - |
+        set -euo pipefail
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+
+          echo ""
+          echo "--------------------------------------------------------------"
+          echo "🐳 Building Service : ${SERVICE_NAME}"
+          echo "📦 Repository       : ${REPOSITORY}"
+          echo "🏷️ Image Tag        : ${RELEASE_VERSION}"
+          echo "--------------------------------------------------------------"
+
+
+          docker build \
+            --pull \
+            -t "${IMAGE}" \
+            "${SERVICE}"
+
+
+          echo "✅ Docker build completed: ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      - |
+        echo ""
+        echo "=============================================================="
+        echo "✅ ALL DOCKER IMAGES BUILT SUCCESSFULLY"
+        echo "=============================================================="
+
+
+      # =================================================================
+      # 🛡️ 6. TRIVY — CONTAINER SECURITY SCAN
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "🛡️ RUNNING TRIVY CONTAINER SECURITY SCANS"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+
+          echo ""
+          echo "--------------------------------------------------------------"
+          echo "🛡️ Scanning Service : ${SERVICE_NAME}"
+          echo "📦 Image            : ${IMAGE}"
+          echo "--------------------------------------------------------------"
+
+
+          # -------------------------------------------------------------
+          # Machine-readable JSON report
+          # -------------------------------------------------------------
+
+          echo "📄 Generating JSON vulnerability report..."
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${SCAN_ROOT}:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image \
+            --severity CRITICAL,HIGH \
+            --format json \
+            --output "/reports/${SERVICE_NAME}-trivy.json" \
+            "${IMAGE}"
+
+
+          # -------------------------------------------------------------
+          # Human-readable report
+          # -------------------------------------------------------------
+
+          echo "📄 Generating human-readable vulnerability report..."
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${SCAN_ROOT}:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image \
+            --severity CRITICAL,HIGH \
+            --format table \
+            --output "/reports/${SERVICE_NAME}-trivy.txt" \
+            "${IMAGE}"
+
+
+          # -------------------------------------------------------------
+          # CRITICAL Vulnerability Gate
+          # -------------------------------------------------------------
+          #
+          # CRITICAL = pipeline failure
+          #
+          # HIGH = reported but does not currently fail the pipeline.
+          #
+          # -------------------------------------------------------------
+
+          echo "🚨 Checking for CRITICAL vulnerabilities..."
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image \
+            --severity CRITICAL \
+            --exit-code 1 \
+            "${IMAGE}"
+
+
+          echo "✅ Trivy security gate passed: ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      - |
+        echo ""
+        echo "=============================================================="
+        echo "✅ TRIVY CRITICAL VULNERABILITY GATE PASSED"
+        echo "=============================================================="
+
+
+      # =================================================================
+      # 📋 7. SBOM — SOFTWARE BILL OF MATERIALS
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "📋 GENERATING SOFTWARE BILL OF MATERIALS"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+
+          echo ""
+          echo "📋 Generating SBOM: ${SERVICE_NAME}"
+
+
+          docker run --rm \
+            -v "${SBOM_ROOT}:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image \
+            --format cyclonedx \
+            --output "/reports/${SERVICE_NAME}-sbom.json" \
+            "${IMAGE}"
+
+
+          echo "✅ SBOM generated: ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      - |
+        echo ""
+        echo "=============================================================="
+        echo "✅ SBOM GENERATION COMPLETED"
+        echo "=============================================================="
+
+
+  # ===================================================================
+  # 📤 8. POST-BUILD
+  # ===================================================================
+  #
+  # Flow:
+  #
+  # Create ECR Repository if Missing
+  #        ↓
+  # Push Approved Image
+  #        ↓
+  # Wait for ECR Scan
+  #        ↓
+  # Check CRITICAL Findings
+  #        ↓
+  # Capture Immutable Digest
+  #        ↓
+  # Generate ECS Deployment Artifacts
+  #
+  # ===================================================================
+
+  post_build:
+
+    commands:
+
+
+      # =================================================================
+      # 🏪 Create Missing ECR Repositories Automatically
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "🏪 CHECKING ECR REPOSITORIES"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+
+          # -------------------------------------------------------------
+          # Check whether repository already exists
+          # -------------------------------------------------------------
+
+          if aws ecr describe-repositories \
+            --repository-names "${REPOSITORY}" \
+            --region "${AWS_REGION}" \
+            >/dev/null 2>&1; then
+
+            echo "✅ Repository already exists → ${REPOSITORY}"
+
+
+          else
+
+            echo ""
+            echo "🏗️ Creating new ECR repository → ${REPOSITORY}"
+
+
+            # -----------------------------------------------------------
+            # Create ECR Repository
+            # -----------------------------------------------------------
+
+            aws ecr create-repository \
+              --repository-name "${REPOSITORY}" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --region "${AWS_REGION}" \
+              >/dev/null
+
+
+            # -----------------------------------------------------------
+            # Create Lifecycle Policy File
+            # -----------------------------------------------------------
+
+            cat > /tmp/ecr-lifecycle-policy.json <<'EOF'
+        {
+          "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Expire untagged images after 1 day",
+              "selection": {
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "countNumber": 1
+              },
+              "action": {
+                "type": "expire"
+              }
+            },
+            {
+              "rulePriority": 2,
+              "description": "Keep latest 4 tagged release images",
+              "selection": {
+                "tagStatus": "tagged",
+                "tagPrefixList": [
+                  "v"
+                ],
+                "countType": "imageCountMoreThan",
+                "countNumber": 4
+              },
+              "action": {
+                "type": "expire"
+              }
+            }
+          ]
+        }
+        EOF
+
+
+            # -----------------------------------------------------------
+            # Apply Lifecycle Policy
+            # -----------------------------------------------------------
+
+            aws ecr put-lifecycle-policy \
+              --repository-name "${REPOSITORY}" \
+              --lifecycle-policy-text file:///tmp/ecr-lifecycle-policy.json \
+              --region "${AWS_REGION}" \
+              >/dev/null
+
+
+            echo "✅ ECR repository configured:"
+            echo "   Repository       : ${REPOSITORY}"
+            echo "   Scan-on-Push     : ENABLED"
+            echo "   Tag Mutability   : IMMUTABLE"
+            echo "   Lifecycle Policy : ENABLED"
+
+          fi
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # =================================================================
+      # 📤 Push Only Images That Passed Local Security Gates
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "📤 PUSHING APPROVED IMAGES TO ECR"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+
+          echo ""
+          echo "📤 Pushing: ${IMAGE}"
+
+
+          docker push "${IMAGE}"
+
+
+          echo "✅ Push completed: ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      - |
+        echo ""
+        echo "=============================================================="
+        echo "✅ ECR PUSH COMPLETED"
+        echo "=============================================================="
+
+
+      # =================================================================
+      # 🔎 ECR SCAN-ON-PUSH
+      # =================================================================
+      #
+      # ECR performs an asynchronous vulnerability scan after push.
+      #
+      # We wait for the scan to complete.
+      #
+      # Maximum:
+      #
+      #   30 attempts × 10 seconds
+      #   = 5 minutes
+      #
+      # Any CRITICAL finding fails the build.
+      #
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "🔎 WAITING FOR ECR SCAN-ON-PUSH RESULTS"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+
+          echo ""
+          echo "--------------------------------------------------------------"
+          echo "🔎 ECR Security Verification: ${SERVICE_NAME}"
+          echo "--------------------------------------------------------------"
+
+
+          STATUS="PENDING"
+
+
+          # -------------------------------------------------------------
+          # Wait for ECR Scan
+          # -------------------------------------------------------------
+
+          for ATTEMPT in $(seq 1 30); do
+
+            STATUS="$(
+              aws ecr describe-image-scan-findings \
+                --repository-name "${REPOSITORY}" \
+                --image-id imageTag="${RELEASE_VERSION}" \
+                --region "${AWS_REGION}" \
+                --query 'imageScanStatus.status' \
+                --output text \
+                2>/dev/null || true
+            )"
+
+
+            echo "🔎 ECR scan attempt ${ATTEMPT}/30 → ${STATUS}"
+
+
+            # -----------------------------------------------------------
+            # Scan Completed
+            # -----------------------------------------------------------
+
+            if [ "${STATUS}" = "COMPLETE" ]; then
+
+              break
+
+            fi
+
+
+            # -----------------------------------------------------------
+            # Scan Failed
+            # -----------------------------------------------------------
+
+            if [ "${STATUS}" = "FAILED" ]; then
+
+              echo "❌ ECR image scan failed."
+
+              exit 1
+
+            fi
+
+
+            sleep 10
+
+          done
+
+
+          # -------------------------------------------------------------
+          # Verify Scan Completion
+          # -------------------------------------------------------------
+
+          if [ "${STATUS}" != "COMPLETE" ]; then
+
+            echo "❌ ECR image scan did not complete within 5 minutes."
+
+            exit 1
+
+          fi
+
+
+          # -------------------------------------------------------------
+          # Store Complete ECR Findings
+          # -------------------------------------------------------------
+
+          echo "📄 Saving ECR vulnerability report..."
+
+
+          aws ecr describe-image-scan-findings \
+            --repository-name "${REPOSITORY}" \
+            --image-id imageTag="${RELEASE_VERSION}" \
+            --region "${AWS_REGION}" \
+            > "${SCAN_ROOT}/${SERVICE_NAME}-ecr-scan.json"
+
+
+          # -------------------------------------------------------------
+          # Extract CRITICAL Finding Count
+          # -------------------------------------------------------------
+
+          CRITICAL_COUNT="$(
+            aws ecr describe-image-scan-findings \
+              --repository-name "${REPOSITORY}" \
+              --image-id imageTag="${RELEASE_VERSION}" \
+              --region "${AWS_REGION}" \
+              --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+              --output text \
+              2>/dev/null || true
+          )"
+
+
+          # -------------------------------------------------------------
+          # Normalize Empty / None Result
+          # -------------------------------------------------------------
+
+          CRITICAL_COUNT="${CRITICAL_COUNT:-0}"
+
+          if [ "${CRITICAL_COUNT}" = "None" ]; then
+
+            CRITICAL_COUNT="0"
+
+          fi
+
+
+          echo "🚨 ${SERVICE_NAME} ECR CRITICAL findings → ${CRITICAL_COUNT}"
+
+
+          # -------------------------------------------------------------
+          # ECR CRITICAL Security Gate
+          # -------------------------------------------------------------
+
+          if [ "${CRITICAL_COUNT}" != "0" ]; then
+
+            echo "❌ ECR CRITICAL vulnerability gate failed → ${SERVICE_NAME}"
+
+            exit 1
+
+          fi
+
+
+          echo "✅ ECR security gate passed → ${SERVICE_NAME}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # =================================================================
+      # 🔐 Capture Immutable ECR Image Digests
+      # =================================================================
+      #
+      # Example:
+      #
+      # ecommerce-user-service:v0.1.25-dev
+      #
+      # becomes:
+      #
+      # ecommerce-user-service@sha256:xxxxxxxx
+      #
+      # The digest is immutable and can later be promoted to:
+      #
+      # DEV → STAGE → PROD
+      #
+      # without rebuilding the image.
+      #
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "🔐 RECORDING IMMUTABLE IMAGE DIGESTS"
+        echo "=============================================================="
+
+
+        python3 - <<'PY'
+        import json
+        import os
+        import subprocess
+
+
+        # ---------------------------------------------------------------
+        # Environment Variables
+        # ---------------------------------------------------------------
+
+        region = os.environ["AWS_REGION"]
+
+        version = os.environ["RELEASE_VERSION"]
+
+        registry = os.environ["ECR_REGISTRY"]
+
+        build_number = os.environ["CODEBUILD_BUILD_NUMBER"]
+
+        commit = os.environ["COMMIT_SHA"]
+
+
+        # ---------------------------------------------------------------
+        # Read Discovered Services
+        # ---------------------------------------------------------------
+
+        with open(
+            "/tmp/ecommerce-services.txt",
+            encoding="utf-8"
+        ) as file:
+
+            services = [
+                line.strip()
+                for line in file
+                if line.strip()
+            ]
+
+
+        # ---------------------------------------------------------------
+        # Release Metadata
+        # ---------------------------------------------------------------
+
+        output = {
+            "release": version,
+            "commit": commit,
+            "build": build_number,
+            "region": region,
+            "services": []
+        }
+
+
+        # ---------------------------------------------------------------
+        # Capture ECR Digest for Every Service
+        # ---------------------------------------------------------------
+
+        for service in services:
+
+            name = os.path.basename(service)
+
+            repository = f"ecommerce-{name}"
+
+
+            digest = subprocess.check_output(
+                [
+                    "aws",
+                    "ecr",
+                    "describe-images",
+                    "--repository-name",
+                    repository,
+                    "--image-ids",
+                    f"imageTag={version}",
+                    "--region",
+                    region,
+                    "--query",
+                    "imageDetails[0].imageDigest",
+                    "--output",
+                    "text"
+                ],
+                text=True
+            ).strip()
+
+
+            output["services"].append(
+                {
+                    "service": name,
+                    "repository": repository,
+                    "tag": version,
+                    "image": (
+                        f"{registry}/{repository}:{version}"
+                    ),
+                    "digest": digest,
+                    "immutableImage": (
+                        f"{registry}/{repository}@{digest}"
+                    )
+                }
+            )
+
+
+        # ---------------------------------------------------------------
+        # Write Release Metadata
+        # ---------------------------------------------------------------
+
+        metadata_file = os.path.join(
+            os.environ["METADATA_ROOT"],
+            "release.json"
+        )
+
+
+        with open(
+            metadata_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                output,
+                file,
+                indent=2
+            )
+
+        print(f"✅ Release metadata written to: {metadata_file}")
+
+        PY
+
+
+      # =================================================================
+      # 🚀 Generate ECS Image Definition Artifacts
+      # =================================================================
+      #
+      # CodePipeline ECS deployment stages can consume these files.
+      #
+      # Example:
+      #
+      # artifacts/ecs/imagedefinitions-user-service.json
+      #
+      # =================================================================
+
+      - |
+        set -euo pipefail
+
+        echo "=============================================================="
+        echo "🚀 GENERATING ECS DEPLOYMENT DEFINITIONS"
+        echo "=============================================================="
+
+
+        while IFS= read -r SERVICE; do
+
+          SERVICE_NAME="$(basename "${SERVICE}")"
+
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+
+          OUTPUT_FILE="${CODEBUILD_SRC_DIR}/artifacts/ecs/imagedefinitions-${SERVICE_NAME}.json"
+
+
+          printf '[{"name":"%s","imageUri":"%s"}]\n' \
+            "${SERVICE_NAME}" \
+            "${IMAGE}" \
+            > "${OUTPUT_FILE}"
+
+
+          echo "✅ ECS definition generated:"
+          echo "   ${OUTPUT_FILE}"
+
+        done < /tmp/ecommerce-services.txt
+
+
+      # =================================================================
+      # 🏁 Final Release Result
+      # =================================================================
+
+      - |
+        echo ""
+        echo "=============================================================="
+        echo "🎉 DEV CI SECURITY PIPELINE PASSED"
+        echo "=============================================================="
+
+        echo "🏷️ Release     : ${RELEASE_VERSION}"
+
+        echo "🔐 Commit      : ${COMMIT_SHA}"
+
+        echo "🛡️ Trivy       : PASS"
+
+        echo "🔎 ECR Scan    : PASS"
+
+        echo "📋 SBOM        : GENERATED"
+
+        echo "📦 Artifacts   : READY"
+
+        echo "🚀 Images are approved for DEV deployment."
+
+        echo "=============================================================="
+
+
+# =====================================================================
+# 📦 CODEPIPELINE / S3 ARTIFACTS
+# =====================================================================
+#
+# CodeBuild sends these files to CodePipeline.
+#
+# CodePipeline stores the output in its configured S3 artifact bucket.
+#
+# These artifacts can later be consumed by:
+#
+#   DEV ECS Deployment
+#   STAGE ECS Deployment
+#   PROD ECS Deployment
+#
+# =====================================================================
+
+artifacts:
+
+  name: "ecommerce-${CODEBUILD_BUILD_NUMBER}"
+
+  discard-paths: no
+
+  files:
+
+    # ---------------------------------------------------------------
+    # Trivy Container Security Reports
+    # ---------------------------------------------------------------
+
+    - "reports/container-scan/**/*"
+
+
+    # ---------------------------------------------------------------
+    # SBOM Files
+    # ---------------------------------------------------------------
+
+    - "reports/sbom/**/*"
+
+
+    # ---------------------------------------------------------------
+    # Release Metadata + ECR Digests
+    # ---------------------------------------------------------------
+
+    - "reports/metadata/**/*"
+
+
+    # ---------------------------------------------------------------
+    # ECS Deployment Definitions
+    # ---------------------------------------------------------------
+
+    - "artifacts/ecs/**/*"
