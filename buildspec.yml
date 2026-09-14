@@ -1,13 +1,13 @@
 ---
 # =====================================================================
-# 🚀 E-COMMERCE — CENTRALIZED DEVSECOPS CI PIPELINE
+# 🚀 E-COMMERCE — CENTRALIZED DEVSECOPS CI PIPELINE 
 # =====================================================================
 # FLOW:
 # GitHub → CodePipeline → CodeBuild → npm CI/Build/Test → SonarQube
 # → Docker Build ONCE → Trivy → ECR Push → ECR Scan → SBOM/Artifacts
 #
 # DESIGN:
-# - No git clone: CodePipeline already provides the source artifact.
+# - No git clone: CodePipeline already provides the source artifacts.
 # - Services are discovered dynamically under application-code/services/*.
 # - A new service only needs package.json, package-lock.json and Dockerfile.
 # - ECR repositories are created automatically using ecommerce-* naming.
