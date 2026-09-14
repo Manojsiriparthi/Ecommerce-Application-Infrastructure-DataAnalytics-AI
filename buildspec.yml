@@ -15,8 +15,8 @@
 # - CRITICAL vulnerabilities fail the build.
 # - Trivy/SBOM/ECR reports are published as CodePipeline/S3 artifacts.
 #
-# REQUIRED CODEBUILD ENVIRONMENT VARIABLE:
-#   SONAR_HOST_URL = https://<your-sonarqube-server>
+# SONARQUBE SERVER:
+#   http://13.232.24.76:9000
 #
 # EXISTING SNS TOPIC FOR PIPELINE NOTIFICATIONS:
 #   arn:aws:sns:ap-south-1:153099270680:tetris-build-notifications
@@ -67,7 +67,7 @@ phases:
       nodejs: 20
 
     commands:
-      - echo "📦 Preparing centralized DevSecOps toolchain..."
+      - 'echo "📦 Preparing centralized DevSecOps toolchain..."'
       - node --version
       - npm --version
       - docker --version
@@ -251,9 +251,9 @@ phases:
       # =================================================================
       # 🔍 3️⃣ SONARQUBE — SAST + QUALITY GATE
       # =================================================================
-      - echo "=========================================="
-      - echo "🔍 RUNNING SONARQUBE SAST"
-      - echo "=========================================="
+      - 'echo "=========================================="'
+      - 'echo "🔍 RUNNING SONARQUBE SAST"'
+      - 'echo "=========================================="'
 
       # The token comes from Secrets Manager through the build environment:
       # sonarqube_token → Sonar_token → SONAR_TOKEN.
@@ -300,7 +300,7 @@ phases:
       # =================================================================
       # 🔐 4️⃣ ECR LOGIN
       # =================================================================
-      - echo "🔐 Logging in to Amazon ECR..."
+      - 'echo "🔐 Logging in to Amazon ECR..."'
       - |
         aws ecr get-login-password \
           --region "${AWS_REGION}" |
@@ -314,7 +314,7 @@ phases:
   build:
     commands:
 
-      - echo "🐳 Building approved application containers..."
+      - 'echo "🐳 Building approved application containers..."'
 
       - |
         set -euo pipefail
@@ -330,12 +330,12 @@ phases:
           docker build --pull -t "${IMAGE}" "${SERVICE}"
         done < /tmp/ecommerce-services.txt
 
-      - echo "✅ All Docker images built."
+      - 'echo "✅ All Docker images built."'
 
       # =================================================================
       # 🛡️ 6️⃣ TRIVY — Container security gate
       # =================================================================
-      - echo "🛡️ Running Trivy container vulnerability scans..."
+      - 'echo "🛡️ Running Trivy container vulnerability scans..."'
 
       - |
         set -euo pipefail
@@ -380,12 +380,12 @@ phases:
 
         done < /tmp/ecommerce-services.txt
 
-      - echo "✅ Trivy CRITICAL vulnerability gate passed."
+      - 'echo "✅ Trivy CRITICAL vulnerability gate passed."'
 
       # =================================================================
       # 📋 7️⃣ SBOM — Generate Software Bill of Materials
       # =================================================================
-      - echo "📋 Generating SBOM..."
+      - 'echo "📋 Generating SBOM..."'
 
       - |
         set -euo pipefail
@@ -405,7 +405,7 @@ phases:
 
         done < /tmp/ecommerce-services.txt
 
-      - echo "✅ SBOM generation completed."
+      - 'echo "✅ SBOM generation completed."'
 
   # ===================================================================
   # 📤 8️⃣ POST-BUILD — ECR repository → Push → Registry scan
@@ -416,7 +416,7 @@ phases:
       # =================================================================
       # 🏪 Create missing ECR repositories automatically
       # =================================================================
-      - echo "🏪 Checking ECR repositories..."
+      - 'echo "🏪 Checking ECR repositories..."'
 
       - |
         set -euo pipefail
@@ -490,7 +490,7 @@ phases:
       # =================================================================
       # 📤 Push only images that passed local security gates
       # =================================================================
-      - echo "📤 Pushing approved images to ECR..."
+      - 'echo "📤 Pushing approved images to ECR..."'
 
       - |
         set -euo pipefail
@@ -505,12 +505,12 @@ phases:
 
         done < /tmp/ecommerce-services.txt
 
-      - echo "✅ ECR push completed."
+      - 'echo "✅ ECR push completed."'
 
       # =================================================================
       # 🔎 ECR Scan-on-Push — wait and evaluate registry findings
       # =================================================================
-      - echo "🔎 Waiting for ECR Scan-on-Push results..."
+      - 'echo "🔎 Waiting for ECR Scan-on-Push results..."'
 
       - |
         set -euo pipefail
@@ -582,7 +582,7 @@ phases:
       # =================================================================
       # 🔐 Capture immutable image digests
       # =================================================================
-      - echo "🔐 Recording immutable image digests..."
+      - 'echo "🔐 Recording immutable image digests..."'
 
       - |
         set -euo pipefail
@@ -649,7 +649,7 @@ phases:
       # =================================================================
       # 🚀 Generate ECS image-definition artifacts
       # =================================================================
-      - echo "🚀 Generating ECS deployment definitions..."
+      - 'echo "🚀 Generating ECS deployment definitions..."'
 
       - |
         set -euo pipefail
@@ -672,16 +672,16 @@ phases:
       # =================================================================
       # 🏁 Final release result
       # =================================================================
-      - echo "=============================================================="
-      - echo "🎉 DEV CI SECURITY PIPELINE PASSED"
+      - 'echo "=============================================================="'
+      - 'echo "🎉 DEV CI SECURITY PIPELINE PASSED"'
       - 'echo "🏷️ Release: ${RELEASE_VERSION}"'
       - 'echo "🔐 Commit: ${COMMIT_SHA}"'
       - 'echo "🛡️ Trivy: PASS"'
       - 'echo "🔎 ECR Scan: PASS"'
       - 'echo "📋 SBOM: GENERATED"'
       - 'echo "📦 Artifacts: READY"'
-      - echo "🚀 Images are approved for DEV deployment."
-      - echo "=============================================================="
+      - 'echo "🚀 Images are approved for DEV deployment."'
+      - 'echo "=============================================================="'
 
 # =====================================================================
 # 📦 CODEPIPELINE / S3 ARTIFACTS
