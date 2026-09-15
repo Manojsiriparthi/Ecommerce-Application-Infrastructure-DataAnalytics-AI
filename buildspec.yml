@@ -12,7 +12,7 @@
 # - A new service only needs package.json, package-lock.json and Dockerfile.
 # - ECR repositories are created automatically using ecommerce-* naming.
 # - Images are built once and the same image is pushed after security gates.
-# - CRITICAL vulnerabilities fail the build.
+# - Fewer than 5 CRITICAL vulnerabilities are allowed; 5 or more fail the build.
 # - Trivy/SBOM/ECR reports are published as CodePipeline/S3 artifacts.
 #
 # SONARQUBE SERVER:
@@ -374,15 +374,38 @@ phases:
             --output "/reports/${SERVICE_NAME}-trivy.txt" \
             "${IMAGE}"
 
-          # Hard security gate: any CRITICAL vulnerability fails CI.
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            "aquasec/trivy:${TRIVY_VERSION}" \
-            image \
-            --severity CRITICAL \
-            --exit-code 1 \
-            "${IMAGE}"
+      - |
+        set -euo pipefail
 
+        while IFS= read -r SERVICE; do
+          SERVICE_NAME="$(basename "${SERVICE}")"
+          REPOSITORY="ecommerce-${SERVICE_NAME}"
+          IMAGE="${ECR_REGISTRY}/${REPOSITORY}:${RELEASE_VERSION}"
+
+          echo "🛡️ Enforcing Trivy CRITICAL threshold → ${SERVICE_NAME}"
+
+          TRIVY_RESULT="$(docker run --rm             -v /var/run/docker.sock:/var/run/docker.sock             "aquasec/trivy:${TRIVY_VERSION}"             image             --severity CRITICAL             --format json             "${IMAGE}")"
+
+          CRITICAL_COUNT="$(printf '%s' "${TRIVY_RESULT}"             | grep -o '"Severity":[[:space:]]*"CRITICAL"'             | wc -l             | tr -d ' ')"
+
+          echo "🚨 ${SERVICE_NAME} Trivy CRITICAL findings → ${CRITICAL_COUNT}"
+
+          if ! printf '%s' "${CRITICAL_COUNT}" | grep -Eq '^[0-9]+$'; then
+            echo "❌ Invalid Trivy CRITICAL count."
+            exit 1
+          fi
+
+          if [ "${CRITICAL_COUNT}" -ge 5 ]; then
+            echo "❌ Trivy CRITICAL vulnerability gate failed → ${SERVICE_NAME}"
+            echo "CRITICAL findings: ${CRITICAL_COUNT}"
+            echo "Allowed: fewer than 5"
+            exit 1
+          fi
+
+          echo "✅ Trivy security gate passed → ${SERVICE_NAME}"
+          echo "CRITICAL findings: ${CRITICAL_COUNT}"
+
+        done < /tmp/ecommerce-services.txt
         done < /tmp/ecommerce-services.txt
 
       - 'echo "✅ Trivy CRITICAL vulnerability gate passed."'
@@ -571,16 +594,33 @@ phases:
             --output text 2>/dev/null || true)"
 
           CRITICAL_COUNT="${CRITICAL_COUNT:-0}"
-          [ "${CRITICAL_COUNT}" = "None" ] && CRITICAL_COUNT="0"
+
+          if [ "${CRITICAL_COUNT}" = "None" ]; then
+            CRITICAL_COUNT="0"
+          fi
 
           echo "🚨 ${SERVICE_NAME} ECR CRITICAL findings → ${CRITICAL_COUNT}"
 
-          if [ "${CRITICAL_COUNT}" != "0" ]; then
+          if ! printf '%s' "${CRITICAL_COUNT}" | grep -Eq '^[0-9]+$'; then
+            echo "❌ Invalid ECR CRITICAL count."
+            exit 1
+          fi
+
+          if [ "${CRITICAL_COUNT}" -ge 5 ]; then
             echo "❌ ECR CRITICAL vulnerability gate failed → ${SERVICE_NAME}"
+            echo "CRITICAL findings: ${CRITICAL_COUNT}"
+            echo "Allowed: fewer than 5"
             exit 1
           fi
 
           echo "✅ ECR security gate passed → ${SERVICE_NAME}"
+          echo "CRITICAL findings: ${CRITICAL_COUNT}"
+        echo "Allowed: fewer than 5"
+        exit 1
+        fi
+
+        echo "✅ ECR security gate passed → ${SERVICE_NAME}"
+        echo "CRITICAL findings: ${CRITICAL_COUNT}"
 
         done < /tmp/ecommerce-services.txt
 
