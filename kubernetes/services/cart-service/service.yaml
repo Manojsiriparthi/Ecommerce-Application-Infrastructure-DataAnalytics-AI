@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart-service
+  namespace: ecommerce
+  labels:
+    app: cart-service
+spec:
+  type: ClusterIP
+  selector:
+    app: cart-service
+    tier: backend
+  ports:
+  - name: http
+    port: 3003
+    targetPort: 3003
+    protocol: TCP
