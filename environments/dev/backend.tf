@@ -25,7 +25,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket       = "pip-project-ecommerce-tfstate-dev"
+    bucket       = "manoj-pip-project-ecommerce-tfstate-dev"
     key          = "dev/terraform.tfstate"
     region       = "ap-south-1"
     encrypt      = true
