@@ -1,0 +1,15 @@
+# Ignore local .terraform cache directories
+**/.terraform/
+.terraform/
+
+# Ignore state files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Ignore secrets and logs
+*.tfvars
+*.tfvars.json
+*.crash.log
+override.tf
+override.tf.json
