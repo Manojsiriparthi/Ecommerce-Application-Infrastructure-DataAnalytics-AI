@@ -1,0 +1,219 @@
+name: PR Quality and Security Checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-security:
+    name: Generic Quality and Security Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # =====================================================
+      # Detect changed files
+      # =====================================================
+
+      - name: Detect changed files
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            > changed-files.txt
+
+          echo "Changed files:"
+          cat changed-files.txt
+
+      # =====================================================
+      # YAML
+      # =====================================================
+
+      - name: Install YAML validator
+        run: pip install yamllint
+
+      - name: Validate changed YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.(yml|yaml)$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No YAML files changed."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Validating YAML: $file"
+            yamllint "$file"
+          done <<< "$files"
+
+      # =====================================================
+      # JSON
+      # =====================================================
+
+      - name: Validate changed JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.json$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No JSON files changed."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Validating JSON: $file"
+            python3 -m json.tool "$file" > /dev/null
+          done <<< "$files"
+
+      # =====================================================
+      # Python
+      # =====================================================
+
+      - name: Validate changed Python
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.py$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No Python files changed."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Validating Python: $file"
+            python3 -m py_compile "$file"
+          done <<< "$files"
+
+      # =====================================================
+      # Shell
+      # =====================================================
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Validate changed shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.sh$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No shell scripts changed."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Validating shell script: $file"
+            shellcheck "$file"
+          done <<< "$files"
+
+      # =====================================================
+      # Terraform
+      # =====================================================
+
+      - name: Validate changed Terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.tf$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No Terraform files changed."
+            exit 0
+          fi
+
+          if ! command -v terraform >/dev/null 2>&1; then
+            echo "Terraform not installed."
+            echo "Terraform validation will be enabled when Terraform is added."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Checking Terraform format: $file"
+            terraform fmt -check "$file"
+          done <<< "$files"
+
+      # =====================================================
+      # JavaScript / TypeScript
+      # =====================================================
+
+      - name: Validate changed JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.(js|mjs|cjs)$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No JavaScript files changed."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            echo "Validating JavaScript: $file"
+            node --check "$file"
+          done <<< "$files"
+
+      # =====================================================
+      # TypeScript
+      # =====================================================
+
+      - name: Validate changed TypeScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=$(grep -E '\.(ts|tsx)$' changed-files.txt || true)
+
+          if [ -z "$files" ]; then
+            echo "No TypeScript files changed."
+            exit 0
+          fi
+
+          if [ -f "package.json" ] && [ -f "tsconfig.json" ]; then
+            echo "TypeScript project detected."
+
+            if command -v npx >/dev/null 2>&1; then
+              npx tsc --noEmit
+            else
+              echo "npx unavailable."
+              exit 1
+            fi
+          else
+            echo "TypeScript files changed, but no root tsconfig.json found."
+            echo "Skipping project-wide TypeScript compilation."
+          fi
+
+      # =====================================================
+      # Secret / Credential Scan
+      # =====================================================
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
