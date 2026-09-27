@@ -6,11 +6,88 @@ resource "aws_kms_key" "main" {
   deletion_window_in_days = 10
   enable_key_rotation     = true
 
+  # Explicit key policy required so AWS services (CloudWatch Logs, Secrets Manager,
+  # ElastiCache, SSM) can use this key. Without this, CreateLogGroup fails with
+  # AccessDeniedException because CloudWatch Logs cannot use a KMS key unless
+  # logs.amazonaws.com is explicitly granted GenerateDataKey + Decrypt.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # Root account full control (required — without this you lose all access)
+      {
+        Sid    = "RootAccountFullControl"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+      # CloudWatch Logs — needed for encrypted log groups (VPC flow logs, app logs)
+      {
+        Sid    = "AllowCloudWatchLogs"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${data.aws_region.current.name}.amazonaws.com"
+        }
+        Action = [
+          "kms:GenerateDataKey*",
+          "kms:Decrypt",
+          "kms:Describe*",
+          "kms:ReEncrypt*",
+          "kms:CreateGrant",
+          "kms:ListGrants"
+        ]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.security.account_id}:*"
+          }
+        }
+      },
+      # Secrets Manager
+      {
+        Sid    = "AllowSecretsManager"
+        Effect = "Allow"
+        Principal = {
+          Service = "secretsmanager.amazonaws.com"
+        }
+        Action = [
+          "kms:GenerateDataKey*",
+          "kms:Decrypt",
+          "kms:Describe*"
+        ]
+        Resource = "*"
+      },
+      # IAM roles with permission can use the key (covers EKS pods via IRSA, Jenkins, etc.)
+      {
+        Sid    = "AllowIAMUsage"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:root"
+        }
+        Action = [
+          "kms:GenerateDataKey*",
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:ReEncrypt*",
+          "kms:DescribeKey",
+          "kms:CreateGrant",
+          "kms:ListGrants"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
   tags = {
     Name        = "${var.project_name}-kms"
     Environment = var.environment
   }
 }
+
+data "aws_caller_identity" "security" {}
+data "aws_region" "current" {}
 
 resource "aws_kms_alias" "main" {
   name          = "alias/${var.project_name}-kms"
