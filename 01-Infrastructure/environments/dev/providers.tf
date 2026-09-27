@@ -1,6 +1,5 @@
 terraform {
-  # NOTE: required_providers block lives in backend.tf
-  # This file only configures provider instances.
+  # required_providers block lives in backend.tf
 }
 
 # ==============================================
@@ -20,9 +19,7 @@ provider "aws" {
 
 # ==============================================
 # DR region provider — us-east-1
-# Used by Aurora Global Database secondary cluster.
-# When enable_global_db = false the aurora module
-# still receives this provider alias but never uses it.
+# Used only by Aurora Global Database secondary cluster.
 # ==============================================
 provider "aws" {
   alias  = "dr"
@@ -41,38 +38,56 @@ provider "aws" {
 # ==============================================
 # Helm + Kubernetes providers
 # ==============================================
-# WHY exec-based auth (not static kubeconfig):
-#   - ~/.kube/config does not exist before the EKS cluster is created.
-#     Using config_path would fail on every fresh apply.
-#   - exec-based auth calls `aws eks get-token` at runtime using the
-#     same AWS credentials already in the environment — no file needed.
-#   - The cluster_name and region are passed as arguments so Terraform
-#     can generate a token for the correct cluster automatically.
-#   - This is the AWS-recommended pattern for Terraform + EKS.
+# PROBLEM WITH data "aws_eks_cluster":
+#   It runs at plan time. On the first apply the cluster doesn't
+#   exist yet so it fails with "couldn't find resource".
 #
-# IMPORTANT: The EKS cluster must be created before any Helm release
-# or Kubernetes resource is applied. The eks_addons module has
-# `depends_on = [module.eks]` which enforces this ordering.
+# SOLUTION — exec-based token via aws CLI:
+#   The exec block calls `aws eks get-token` lazily — only when
+#   Terraform actually needs to talk to Kubernetes (i.e. when
+#   applying a helm_release or kubernetes resource).
+#   During the first plan/apply the Helm provider is configured
+#   but never connects because eks_addons runs AFTER the EKS
+#   module creates the cluster.
+#
+#   cluster_endpoint and cluster_ca_certificate come from the
+#   module outputs. On the first plan these are "known after apply"
+#   (empty) so Terraform skips Helm provider validation entirely.
+#   On apply, by the time eks_addons runs, the values are real.
 # ==============================================
-
-data "aws_eks_cluster" "ecommerce" {
-  name = "pip-project-ecommerce-cluster"
-}
-
-data "aws_eks_cluster_auth" "ecommerce" {
-  name = "pip-project-ecommerce-cluster"
-}
 
 provider "helm" {
   kubernetes {
-    host                   = data.aws_eks_cluster.ecommerce.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.ecommerce.token
+    host = try(module.eks.cluster_endpoint, "")
+    cluster_ca_certificate = try(
+      base64decode(module.eks.cluster_certificate_authority_data),
+      ""
+    )
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args = [
+        "eks", "get-token",
+        "--cluster-name", "pip-project-ecommerce-cluster",
+        "--region", var.primary_region
+      ]
+    }
   }
 }
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.ecommerce.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.ecommerce.token
+  host = try(module.eks.cluster_endpoint, "")
+  cluster_ca_certificate = try(
+    base64decode(module.eks.cluster_certificate_authority_data),
+    ""
+  )
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args = [
+      "eks", "get-token",
+      "--cluster-name", "pip-project-ecommerce-cluster",
+      "--region", var.primary_region
+    ]
+  }
 }

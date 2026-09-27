@@ -28,30 +28,38 @@ provider "aws" {
   }
 }
 
-# ==============================================
-# Helm + Kubernetes — exec-based EKS auth
-# No ~/.kube/config needed. Token generated at runtime
-# using aws eks get-token via the same AWS credentials
-# already in the environment. Correct pattern for CI/CD.
-# ==============================================
-data "aws_eks_cluster" "ecommerce" {
-  name = "pip-project-ecommerce-cluster"
-}
-
-data "aws_eks_cluster_auth" "ecommerce" {
-  name = "pip-project-ecommerce-cluster"
-}
-
 provider "helm" {
   kubernetes {
-    host                   = data.aws_eks_cluster.ecommerce.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.ecommerce.token
+    host = try(module.eks.cluster_endpoint, "")
+    cluster_ca_certificate = try(
+      base64decode(module.eks.cluster_certificate_authority_data),
+      ""
+    )
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args = [
+        "eks", "get-token",
+        "--cluster-name", "pip-project-ecommerce-cluster",
+        "--region", var.primary_region
+      ]
+    }
   }
 }
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.ecommerce.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.ecommerce.token
+  host = try(module.eks.cluster_endpoint, "")
+  cluster_ca_certificate = try(
+    base64decode(module.eks.cluster_certificate_authority_data),
+    ""
+  )
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args = [
+      "eks", "get-token",
+      "--cluster-name", "pip-project-ecommerce-cluster",
+      "--region", var.primary_region
+    ]
+  }
 }
