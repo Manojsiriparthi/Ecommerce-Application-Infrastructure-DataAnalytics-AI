@@ -47,7 +47,7 @@ resource "aws_secretsmanager_secret_version" "db_creds" {
 }
 
 # ==============================================
-# SSM Parameters — application secrets (SecureString)
+# SSM Parameters - application secrets (SecureString)
 # ==============================================
 # WHY SECURESTRING IN SSM (not Secrets Manager):
 #   JWT secret and internal service key are short strings.
@@ -109,7 +109,7 @@ resource "aws_ssm_parameter" "ses_from_email" {
 }
 
 # ==============================================
-# GuardDuty — threat detection
+# GuardDuty - threat detection
 # Rubric requirement: GuardDuty enabled, HIGH severity < 5
 # Detects: compromised EC2/EKS nodes, unusual API calls,
 #          crypto-mining, data exfiltration attempts
@@ -141,7 +141,7 @@ resource "aws_guardduty_detector" "ecommerce" {
   }
 }
 
-# CloudWatch alarm — HIGH severity GuardDuty findings
+# CloudWatch alarm - HIGH severity GuardDuty findings
 # Rubric: HIGH severity findings < 5
 resource "aws_cloudwatch_metric_alarm" "guardduty_high" {
   alarm_name          = "${var.project_name}-guardduty-high-findings"
@@ -152,7 +152,7 @@ resource "aws_cloudwatch_metric_alarm" "guardduty_high" {
   period              = 300
   statistic           = "Sum"
   threshold           = 1
-  alarm_description   = "GuardDuty HIGH/CRITICAL finding detected — investigate immediately"
+  alarm_description   = "GuardDuty HIGH/CRITICAL finding detected - investigate immediately"
   treat_missing_data  = "notBreaching"
 
   dimensions = {
@@ -222,7 +222,7 @@ resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   }
 }
 
-# Flow log resource — vpc_id passed in as variable
+# Flow log resource - vpc_id passed in as variable
 resource "aws_flow_log" "ecommerce" {
   count           = var.vpc_id != "" ? 1 : 0
 

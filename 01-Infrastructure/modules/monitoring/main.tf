@@ -405,7 +405,7 @@ resource "aws_iam_role_policy_attachment" "dlm" {
 }
 
 resource "aws_dlm_lifecycle_policy" "ebs_snapshots" {
-  description        = "${var.project_name} - daily EBS snapshots, 7-day retention"
+  description        = "${var.project_name} daily EBS snapshots 7 day retention"
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
 
@@ -419,7 +419,7 @@ resource "aws_dlm_lifecycle_policy" "ebs_snapshots" {
     }
 
     schedule {
-      name = "Daily EBS snapshot - 7 day retention"
+      name = "Daily EBS snapshot 7 day retention"
 
       create_rule {
         interval      = 24

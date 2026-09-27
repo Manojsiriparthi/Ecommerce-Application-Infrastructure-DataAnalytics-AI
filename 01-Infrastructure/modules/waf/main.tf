@@ -421,7 +421,7 @@ resource "aws_ssm_parameter" "internal_alb_dns" {
   name        = "/${var.project_name}/${var.environment}/alb/internal-dns"
   type        = "String"
   value       = "PLACEHOLDER_UPDATE_AFTER_INGRESS_APPLY"
-  description = "Internal ALB DNS — update after kubectl apply of services-internal-ingress"
+  description = "Internal ALB DNS - update after kubectl apply of services-internal-ingress"
 
   lifecycle {
     ignore_changes = [value]  # Never overwritten by Terraform after initial create
