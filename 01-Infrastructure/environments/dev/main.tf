@@ -211,13 +211,11 @@ module "waf" {
 # ==============================================
 module "route53_acm" {
   source = "../../modules/route53-acm"
+  count  = var.domain_name != "" ? 1 : 0   # skip entirely when no domain registered
 
   project_name = "pip-project-ecommerce"
   environment  = var.environment
   domain_name  = var.domain_name
-
-  # Populated on second apply after ALB is provisioned.
-  # The infra pipeline reads this from SSM and passes it here.
   alb_dns_name = var.alb_dns_name
   alb_zone_id  = var.alb_dns_name != "" ? "Z11127IXD6XFTK" : ""
 
@@ -234,7 +232,6 @@ resource "null_resource" "networking_dependency" {
     module.aurora,
     module.elasticache,
     module.waf,
-    module.route53_acm,
     module.compute
   ]
 }
