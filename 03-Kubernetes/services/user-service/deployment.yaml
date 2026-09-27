@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service-deployment
+  namespace: ecommerce
+  labels:
+    app: user-service
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: user-service
+        tier: backend
+      annotations:
+        # Redeploy when secrets rotate (optional — remove if you handle rotation separately)
+        secret-hash: "v1"
+    spec:
+      # IRSA — this ServiceAccount is annotated with the IAM role ARN that allows
+      # Secrets Manager + SSM Parameter Store access via IRSA (no node-level IAM).
+      serviceAccountName: ecommerce-services-sa
+
+      volumes:
+      # ==============================================
+      # Secrets Store CSI Driver volume
+      # Mounts secrets from AWS Secrets Manager as files.
+      # WHY FILES NOT ENV VARS:
+      #  - Env vars are visible in `kubectl describe pod`, CI logs, crash dumps.
+      #  - File mounts are only readable by the process, auto-refreshed on rotation.
+      #  - This is the AWS-recommended pattern for EKS secrets.
+      # ==============================================
+      - name: aws-secrets
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "user-service-secrets"
+
+      containers:
+      - name: user-service
+        image: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/pip-project-ecommerce/user-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4001   # FIXED: was 3001
+          name: http
+
+        volumeMounts:
+        - name: aws-secrets
+          mountPath: "/mnt/secrets"
+          readOnly: true
+
+        env:
+        # Non-sensitive config — sourced from ConfigMap / plain values
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "4001"
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: aws_region
+
+        # Sensitive — DATABASE_URL is built from the secret file at startup.
+        # The app reads /mnt/secrets/db-host, /mnt/secrets/db-user, etc.
+        # and constructs the Prisma DATABASE_URL. This avoids any secret in env vars.
+        # Alternatively use the DATABASE_URL directly from the secret file:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: user-db-url   # synced from Secrets Manager by SecretProviderClass
+              key: database_url
+
+        # JWT secret — synced K8s secret from Secrets Manager
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: jwt_secret
+
+        # Internal service key for /internal/* endpoints
+        - name: INTERNAL_SERVICE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: internal_service_key
+
+        # SNS topic ARN — non-sensitive config, from SSM via ConfigMap
+        - name: SNS_TOPIC_ARN
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: sns_topic_arn
+
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 4001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [user-service]
+              topologyKey: kubernetes.io/hostname

@@ -1,0 +1,121 @@
+# =============================================================================
+# ArgoCD Application — ecommerce-app
+# =============================================================================
+# This is the core GitOps manifest. It tells ArgoCD:
+#   - WHERE the desired state lives  (git repo + branch + path)
+#   - WHERE to deploy it             (EKS cluster + namespace)
+#   - HOW to sync                    (automated on git push to main)
+#   - WHAT to do on failure          (self-heal, prune orphaned resources)
+#
+# THE GITOPS LOOP:
+#   1. Jenkins CI pipeline builds + tests all images
+#   2. CI pipeline patches deployment YAMLs with new image tags
+#   3. CI pipeline commits to release/vX.Y.Z branch + raises PR
+#   4. Human reviews PR → approves → merges to main
+#   5. ArgoCD detects change in main branch (polls every 3 min)
+#   6. ArgoCD compares live cluster state vs git state → drift detected
+#   7. ArgoCD applies the updated deployments → new pods roll out
+#   8. ArgoCD health checks confirm rollout success → Slack notification
+#
+# SYNC POLICY:
+#   automated.prune: true
+#     If you delete a deployment YAML from git, ArgoCD deletes it from the cluster.
+#     No manual kubectl delete needed.
+#   automated.selfHeal: true
+#     If someone runs kubectl edit/delete directly on the cluster, ArgoCD
+#     reverts it back to what git says. Git is the single source of truth.
+#   automated.allowEmpty: false
+#     Prevents ArgoCD from syncing an empty state (safety guard).
+#
+# REPLACE BEFORE APPLYING:
+#   <GITHUB_ORG>/<REPO>  → your actual GitHub org/repo
+#                          (same value as in project.yaml sourceRepos)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ecommerce-app
+  namespace: argocd
+  labels:
+    project: pip-project-ecommerce
+    managed-by: argocd
+  annotations:
+    # Slack channel for ArgoCD notifications (matches Jenkins #deployments)
+    notifications.argoproj.io/subscribe.on-deployed.slack: deployments
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+  # Prevent accidental deletion via kubectl delete
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # Must match the AppProject name above
+  project: pip-project-ecommerce
+
+  # ── Source: where ArgoCD reads the desired state ───────────────────────────
+  source:
+    # Replace with your actual GitHub repo URL
+    repoURL: "https://github.com/<GITHUB_ORG>/<REPO>.git"
+
+    # ArgoCD watches this branch.
+    # Jenkins CI merges to main → ArgoCD detects the change → deploys.
+    targetRevision: main
+
+    # ArgoCD manages everything under 03-Kubernetes/ EXCEPT argocd/ itself.
+    # It recursively applies all subdirectories.
+    path: 03-Kubernetes
+
+    # Directory-based app — no Helm, no Kustomize
+    # All manifests are plain YAML files
+    directory:
+      recurse: true
+      exclude: |
+        argocd/**
+        db/**
+
+  # ── Destination: where ArgoCD deploys to ──────────────────────────────────
+  destination:
+    # Local EKS cluster (the one ArgoCD is installed in)
+    server: https://kubernetes.default.svc
+    namespace: ecommerce
+
+  # ── Sync policy ────────────────────────────────────────────────────────────
+  syncPolicy:
+    automated:
+      # Auto-sync when ArgoCD detects a diff between git and cluster
+      prune: true          # Delete resources removed from git
+      selfHeal: true       # Revert manual kubectl changes
+      allowEmpty: false    # Never sync to an empty state
+
+    syncOptions:
+      # Create namespace if it doesn't exist
+      - CreateNamespace=true
+      # Don't fail if a resource already exists (handles re-applies cleanly)
+      - ApplyOutOfSyncOnly=true
+      # Use server-side apply for better conflict handling
+      - ServerSideApply=true
+
+    # Retry on failure — transient errors (API server busy, etc.)
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  # ── Health and ignoreDifferences ──────────────────────────────────────────
+  # Ignore fields that change at runtime and should not trigger a sync
+  ignoreDifferences:
+    # HPA min/max replicas are managed by Cluster Autoscaler at runtime
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/minReplicas
+        - /spec/maxReplicas
+    # Webhooks and admission controllers modify these fields at runtime
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/template/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration
+
+  # Revisions to keep in history (for rollback)
+  revisionHistoryLimit: 10

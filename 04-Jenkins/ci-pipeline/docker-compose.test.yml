@@ -1,0 +1,244 @@
+# =============================================================================
+# CI TEST HARNESS — docker-compose.test.yml
+# =============================================================================
+# PURPOSE:
+#   Spins up the EXACT same Docker images built in the CI pipeline to run
+#   integration tests, health checks, and smoke tests BEFORE pushing to ECR.
+#   The image that passes here is the same image deployed to Kubernetes.
+#   Never run in production — only used inside the Jenkins CI agent.
+#
+# HOW IT WORKS:
+#   1. Jenkins builds all 6 service images (tagged :ci-${BUILD_NUMBER})
+#   2. Jenkins writes a .env.test file with DB creds + test secrets
+#   3. `docker compose -f docker-compose.test.yml up --wait` starts everything
+#      The --wait flag waits for ALL healthchecks to pass before returning.
+#      If any service fails its healthcheck, compose exits non-zero → CI fails.
+#   4. Jenkins runs the smoke/integration test script against the running stack
+#   5. `docker compose -f docker-compose.test.yml down -v` tears everything down
+#
+# POSTGRES IN CI:
+#   Uses a plain postgres:16 container — NOT Aurora. The application code uses
+#   standard Prisma/pg driver; Aurora is wire-compatible with Postgres so the
+#   same schema/queries work identically. Aurora-specific features (global DB,
+#   RDS Proxy) are infra-level and not tested here.
+#
+# ENVIRONMENT VARIABLES:
+#   All values come from .env.test written by the Jenkinsfile before compose up.
+#   Nothing is hardcoded. Sensitive values are Jenkins credentials injected at
+#   runtime and written to .env.test (deleted after compose down).
+#
+# IMAGE TAGS:
+#   Injected via IMAGE_TAG env var set by Jenkinsfile:
+#     IMAGE_TAG=ci-${BUILD_NUMBER}
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # POSTGRES — single instance, all 6 services share one server, each gets
+  # its own database. This mirrors the Aurora setup where one cluster hosts
+  # multiple databases. Each Prisma migrate creates its own DB.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ci-postgres
+    environment:
+      POSTGRES_USER:     ${CI_DB_USER:-ciuser}
+      POSTGRES_PASSWORD: ${CI_DB_PASSWORD}
+      POSTGRES_DB:       postgres          # default db; services create their own
+    ports:
+      - "5433:5432"                        # 5433 to avoid conflicts on the agent
+    volumes:
+      - ci-postgres-data:/var/lib/postgresql/data
+      - ./init-ci-dbs.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CI_DB_USER:-ciuser} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # USER SERVICE
+  # ---------------------------------------------------------------------------
+  user-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/user-service:${IMAGE_TAG}
+    container_name: ci-user-service
+    environment:
+      NODE_ENV:             test
+      PORT:                 "4001"
+      DATABASE_URL:         postgresql://${CI_DB_USER:-ciuser}:${CI_DB_PASSWORD}@postgres:5432/user_db
+      JWT_SECRET:           ${CI_JWT_SECRET}
+      INTERNAL_SERVICE_KEY: ${CI_INTERNAL_KEY}
+      AWS_REGION:           ap-south-1
+      SNS_TOPIC_ARN:        ""              # SNS disabled in CI — no AWS calls
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4001/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # PRODUCT SERVICE
+  # ---------------------------------------------------------------------------
+  product-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/product-service:${IMAGE_TAG}
+    container_name: ci-product-service
+    environment:
+      NODE_ENV:     test
+      PORT:         "4002"
+      DATABASE_URL: postgresql://${CI_DB_USER:-ciuser}:${CI_DB_PASSWORD}@postgres:5432/product_db
+      JWT_SECRET:   ${CI_JWT_SECRET}
+      AWS_REGION:   ap-south-1
+      SNS_TOPIC_ARN: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4002/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # CART SERVICE
+  # ---------------------------------------------------------------------------
+  cart-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/cart-service:${IMAGE_TAG}
+    container_name: ci-cart-service
+    environment:
+      NODE_ENV:     test
+      PORT:         "4003"
+      DATABASE_URL: postgresql://${CI_DB_USER:-ciuser}:${CI_DB_PASSWORD}@postgres:5432/cart_db
+      JWT_SECRET:   ${CI_JWT_SECRET}
+      AWS_REGION:   ap-south-1
+      # Redis disabled in CI — cart works without it (falls back to DB-only)
+      REDIS_HOST:   ""
+      REDIS_PORT:   "6379"
+      REDIS_AUTH_TOKEN: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4003/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # ORDER SERVICE
+  # ---------------------------------------------------------------------------
+  order-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/order-service:${IMAGE_TAG}
+    container_name: ci-order-service
+    environment:
+      NODE_ENV:             test
+      PORT:                 "4004"
+      DATABASE_URL:         postgresql://${CI_DB_USER:-ciuser}:${CI_DB_PASSWORD}@postgres:5432/order_db
+      JWT_SECRET:           ${CI_JWT_SECRET}
+      INTERNAL_SERVICE_KEY: ${CI_INTERNAL_KEY}
+      AWS_REGION:           ap-south-1
+      SNS_TOPIC_ARN:        ""
+      # Calls payment-service and user-service by Docker service name
+      PAYMENT_SERVICE_URL:  http://payment-service:4005
+      USER_SERVICE_URL:     http://user-service:4001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4004/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # PAYMENT SERVICE
+  # ---------------------------------------------------------------------------
+  payment-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/payment-service:${IMAGE_TAG}
+    container_name: ci-payment-service
+    environment:
+      NODE_ENV:             test
+      PORT:                 "4005"
+      DATABASE_URL:         postgresql://${CI_DB_USER:-ciuser}:${CI_DB_PASSWORD}@postgres:5432/payment_db
+      JWT_SECRET:           ${CI_JWT_SECRET}
+      INTERNAL_SERVICE_KEY: ${CI_INTERNAL_KEY}
+      AWS_REGION:           ap-south-1
+      SNS_TOPIC_ARN:        ""
+      USER_SERVICE_URL:     http://user-service:4001
+      REDIS_HOST:           ""
+      REDIS_AUTH_TOKEN:     ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4005/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: no
+    networks:
+      - ci-network
+
+  # ---------------------------------------------------------------------------
+  # NOTIFICATION SERVICE  — no DB, no Redis, just SNS/SES (both disabled in CI)
+  # ---------------------------------------------------------------------------
+  notification-service:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/pip-project-ecommerce/notification-service:${IMAGE_TAG}
+    container_name: ci-notification-service
+    environment:
+      NODE_ENV:        test
+      PORT:            "4006"
+      AWS_REGION:      ap-south-1
+      SNS_TOPIC_ARN:   ""
+      SNS_SMS_ENABLED: "false"
+      SES_FROM_EMAIL:  ""
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4006/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: no
+    networks:
+      - ci-network
+
+# =============================================================================
+# VOLUMES + NETWORKS
+# =============================================================================
+volumes:
+  ci-postgres-data:
+    driver: local
+
+networks:
+  ci-network:
+    driver: bridge

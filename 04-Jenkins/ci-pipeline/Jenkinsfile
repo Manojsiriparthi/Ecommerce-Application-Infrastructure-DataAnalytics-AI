@@ -1,0 +1,920 @@
+// =============================================================================
+// pip-project-ecommerce — CI PIPELINE
+// =============================================================================
+// FULL FLOW (every step explained):
+//
+//  1. Workspace Clean         → wipe stale files from previous builds
+//  2. Checkout                → fetch exact commit from GitHub
+//  3. Validate                → check all Dockerfiles + package.json exist
+//  4. SonarQube SAST          → static analysis + quality gate (blocks on fail)
+//  5. npm Install             → deterministic install for all 6 services
+//  6. npm Build               → compile TypeScript for all services
+//  7. Unit Tests              → run npm test per service (if defined)
+//  8. Prisma Generate         → generate Prisma clients inside each service
+//  9. Docker Build (ONCE)     → build all images tagged :ci-<BUILD_NUMBER>
+//                               THE SAME IMAGE IS TESTED AND DEPLOYED — no rebuild
+// 10. Integration Tests       → docker compose up with CI Postgres
+//                               runs smoke-tests.sh (health + full API flows)
+//                               tears down stack after (win or lose)
+// 11. Trivy Scan              → scan every image for CRITICAL/HIGH CVEs
+//                               gate: fail if CRITICAL ≥ 5
+// 12. Push to ECR             → only runs after ALL gates pass
+//                               tags: :ci-<BUILD_NUMBER>  AND  :<RELEASE_VERSION>
+// 13. ECR Scan Verification   → wait for ECR scan-on-push and validate
+// 14. SBOM                    → CycloneDX SBOM per image → archived in S3
+// 15. Update Image Tags       → yq patches deployment YAML files in the repo
+//                               with the new ECR image URI
+// 16. Commit + Push Branch    → commits patched YAMLs to release/<version> branch
+// 17. Raise PR to main        → GitHub CLI creates PR: release → main
+//                               PR description includes Trivy + ECR scan links
+// 18. Slack Notification      → posts result with PR link to #deployments
+//
+// AFTER THIS PIPELINE:
+//   A human reviews the PR. On approval + merge to main, ArgoCD detects
+//   the updated image tags and syncs the new deployment to EKS.
+//
+// JENKINS PREREQUISITES:
+//   Credentials (Manage Jenkins → Credentials):
+//     aws-credentials    : AWS Access Key + Secret (type: AWS Credentials)
+//     github-ssh-key     : SSH key for git push (type: SSH Username + Private Key)
+//     github-token       : GitHub Personal Access Token for gh pr create (type: Secret text)
+//     sonarqube-token    : SonarQube token (type: Secret text)  OR via SonarQube server config
+//     slack-webhook      : Slack webhook URL (type: Secret text)
+//     ci-db-password     : Postgres password for test harness (type: Secret text)
+//     ci-jwt-secret      : JWT secret for test harness (type: Secret text)
+//     ci-internal-key    : Internal service key for test harness (type: Secret text)
+//
+//   Plugins:
+//     Pipeline, AWS Steps, Git, SonarQube Scanner, Docker Pipeline,
+//     Slack Notification, AnsiColor, Timestamper, Credentials Binding
+//
+//   Agent label "ci" must have installed:
+//     docker, docker compose v2, node 20, aws cli, trivy, jq, yq, curl,
+//     gh (GitHub CLI), git
+//
+//   SonarQube server configured in Jenkins at:
+//     Manage Jenkins → Configure System → SonarQube servers
+//     Name: "sonarqube"  URL: http://13.232.24.76:9000
+// =============================================================================
+
+pipeline {
+
+    agent { label 'ci' }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds(abortPrevious: true)  // Cancel older run on new push
+    }
+
+    // -------------------------------------------------------------------------
+    // ENVIRONMENT — all non-secret build-wide config
+    // -------------------------------------------------------------------------
+    environment {
+        PROJECT_NAME   = 'pip-project-ecommerce'
+        AWS_REGION     = 'ap-south-1'
+        AWS_ACCOUNT_ID = '153099270680'          // Update to your account ID
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        SONAR_HOST_URL = 'http://13.232.24.76:9000'
+        SONAR_PROJECT  = 'ecommerce-application'
+
+        // Docker compose test harness file location
+        COMPOSE_FILE   = '04-Jenkins/ci-pipeline/docker-compose.test.yml'
+        SMOKE_SCRIPT   = '04-Jenkins/ci-pipeline/smoke-tests.sh'
+        INIT_SQL       = '04-Jenkins/ci-pipeline/init-ci-dbs.sql'
+
+        // K8s deployment files that get patched with the new image tag
+        K8S_SERVICES_DIR = '03-Kubernetes/services'
+        K8S_FRONTEND_DIR = '03-Kubernetes/frontend'
+
+        // S3 bucket for SBOM + scan artifacts (same logs bucket from WAF module)
+        ARTIFACTS_S3_PREFIX = 'ci-artifacts'
+
+        // Trivy version pinned — update deliberately
+        TRIVY_VERSION  = '0.56.2'
+    }
+
+    stages {
+
+        // =====================================================================
+        // STAGE 1 — WORKSPACE CLEAN + CHECKOUT
+        // =====================================================================
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+
+                script {
+                    // Derive release version from git tag or build number
+                    def gitTag = sh(
+                        script: "git tag --points-at HEAD | head -1",
+                        returnStdout: true
+                    ).trim()
+
+                    env.RELEASE_VERSION = gitTag?.trim()
+                        ? gitTag
+                        : "v0.1.${env.BUILD_NUMBER}"
+
+                    // Short SHA for traceability in image labels
+                    env.GIT_SHA = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+
+                    // Branch name (safe for use as git branch name)
+                    env.GIT_BRANCH_SAFE = sh(
+                        script: "git rev-parse --abbrev-ref HEAD | tr '/' '-'",
+                        returnStdout: true
+                    ).trim()
+
+                    // Image tag used throughout — BUILD_NUMBER keeps it unique per run
+                    env.IMAGE_TAG = "ci-${env.BUILD_NUMBER}"
+
+                    echo "✅ Checkout complete"
+                    echo "   Release version : ${env.RELEASE_VERSION}"
+                    echo "   Image tag       : ${env.IMAGE_TAG}"
+                    echo "   Git SHA         : ${env.GIT_SHA}"
+                    echo "   Branch          : ${env.GIT_BRANCH_SAFE}"
+                }
+
+                // Discover all services dynamically — adding a new service
+                // requires only a Dockerfile + package.json, nothing else
+                sh '''
+                    SERVICES_FILE=/tmp/services.txt
+                    > "$SERVICES_FILE"
+
+                    for dir in 02-Application-Code/services/*/; do
+                        [ -f "${dir}package.json" ] && [ -f "${dir}Dockerfile" ] \
+                            && echo "$dir" >> "$SERVICES_FILE"
+                    done
+
+                    [ -f "02-Application-Code/frontend/package.json" ] \
+                        && [ -f "02-Application-Code/frontend/Dockerfile" ] \
+                        && echo "02-Application-Code/frontend" >> "$SERVICES_FILE"
+
+                    echo "Discovered services:"
+                    cat "$SERVICES_FILE"
+                '''
+            }
+        }
+
+        // =====================================================================
+        // STAGE 2 — SONARQUBE SAST + QUALITY GATE
+        // Quality gate is a hard block — pipeline fails here if code
+        // quality thresholds are not met. No images are built until this passes.
+        // =====================================================================
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonarqube') {
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                        sh '''
+                            echo "🔍 Running SonarQube SAST..."
+
+                            docker run --rm \
+                                -e SONAR_HOST_URL="${SONAR_HOST_URL}" \
+                                -e SONAR_TOKEN="${SONAR_TOKEN}" \
+                                -v "${WORKSPACE}:/usr/src" \
+                                sonarsource/sonar-scanner-cli:12.1 \
+                                -Dsonar.projectKey="${SONAR_PROJECT}" \
+                                -Dsonar.projectName="Ecommerce Application" \
+                                -Dsonar.projectVersion="${RELEASE_VERSION}" \
+                                -Dsonar.sources=02-Application-Code \
+                                -Dsonar.exclusions="**/node_modules/**,**/.next/**,**/dist/**,**/coverage/**,**/prisma/**" \
+                                -Dsonar.sourceEncoding=UTF-8 \
+                                -Dsonar.qualitygate.wait=true \
+                                -Dsonar.qualitygate.timeout=300
+
+                            echo "✅ SonarQube quality gate passed."
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 3 — npm INSTALL + BUILD + UNIT TESTS + PRISMA GENERATE
+        // Runs across all services. Each runs in its own dir (cd).
+        // =====================================================================
+        stage('Install, Build & Unit Test') {
+            steps {
+                sh '''
+                    set -euo pipefail
+
+                    while IFS= read -r SERVICE; do
+                        SVC_NAME=$(basename "$SERVICE")
+                        echo ""
+                        echo "══════════════════════════════════════════"
+                        echo "  📦 Processing: $SVC_NAME"
+                        echo "══════════════════════════════════════════"
+
+                        cd "${WORKSPACE}/${SERVICE}"
+
+                        # Deterministic install — uses package-lock.json exactly
+                        echo "📦 npm ci..."
+                        npm ci
+
+                        # TypeScript compile
+                        echo "🏗️  npm run build..."
+                        npm run build
+
+                        # Prisma client generation (services with prisma/ directory)
+                        if [ -d "prisma" ]; then
+                            echo "🗄️  Generating Prisma client..."
+                            npx prisma generate
+                        fi
+
+                        # Unit tests (optional per service — skip if no test script)
+                        HAS_TEST=$(node -e "
+                            const p = require('./package.json');
+                            process.exit(p.scripts && p.scripts.test ? 0 : 1);
+                        " 2>/dev/null; echo $?)
+
+                        if [ "$HAS_TEST" = "0" ]; then
+                            echo "🧪 npm test..."
+                            npm test
+                            echo "✅ Tests passed: $SVC_NAME"
+                        else
+                            echo "ℹ️  No unit tests defined for $SVC_NAME — skipping."
+                        fi
+
+                        cd "${WORKSPACE}"
+
+                    done < /tmp/services.txt
+
+                    echo ""
+                    echo "✅ All services installed, built, and tested."
+                '''
+            }
+        }
+
+        // =====================================================================
+        // STAGE 4 — DOCKER BUILD (ONCE)
+        // Images are built exactly ONCE here. The same image that passes
+        // all tests below is pushed to ECR — no rebuild later.
+        // Tags with IMAGE_TAG (ci-<BUILD_NUMBER>) now; re-tags to RELEASE_VERSION at push time.
+        // =====================================================================
+        stage('Docker Build') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "🔐 ECR login..."
+                        aws ecr get-login-password --region "${AWS_REGION}" | \
+                            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+                            IMAGE="${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+                            echo ""
+                            echo "🐳 Building: $SVC_NAME → $IMAGE"
+
+                            docker build \
+                                --pull \
+                                --label "git.sha=${GIT_SHA}" \
+                                --label "build.number=${BUILD_NUMBER}" \
+                                --label "release.version=${RELEASE_VERSION}" \
+                                --label "service.name=${SVC_NAME}" \
+                                -t "${IMAGE}" \
+                                "${WORKSPACE}/${SERVICE}"
+
+                            echo "✅ Built: $IMAGE"
+                        done < /tmp/services.txt
+
+                        echo ""
+                        echo "✅ All Docker images built."
+                        docker images | grep "${ECR_REGISTRY}"
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 5 — INTEGRATION + HEALTH + SMOKE TESTS
+        // Spins up the full stack using docker-compose.test.yml.
+        // The --wait flag means compose only returns when ALL healthchecks pass.
+        // smoke-tests.sh then runs the full API integration test suite.
+        // Stack is always torn down in post{} whether tests pass or fail.
+        // =====================================================================
+        stage('Integration & Smoke Tests') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'ci-db-password',  variable: 'CI_DB_PASSWORD'),
+                    string(credentialsId: 'ci-jwt-secret',   variable: 'CI_JWT_SECRET'),
+                    string(credentialsId: 'ci-internal-key', variable: 'CI_INTERNAL_KEY')
+                ]) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "🧪 Starting CI test stack..."
+
+                        # Write .env.test — used by docker-compose.test.yml
+                        # Written to a temp file so values never appear in console
+                        cat > "${WORKSPACE}/04-Jenkins/ci-pipeline/.env.test" << ENVEOF
+AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}
+AWS_REGION=${AWS_REGION}
+IMAGE_TAG=${IMAGE_TAG}
+CI_DB_USER=ciuser
+CI_DB_PASSWORD=${CI_DB_PASSWORD}
+CI_JWT_SECRET=${CI_JWT_SECRET}
+CI_INTERNAL_KEY=${CI_INTERNAL_KEY}
+ENVEOF
+
+                        # Copy init SQL next to compose file (Docker volume mount)
+                        # Already exists in repo — just confirming path
+                        ls -la "${WORKSPACE}/${COMPOSE_FILE}"
+                        ls -la "${WORKSPACE}/04-Jenkins/ci-pipeline/init-ci-dbs.sql"
+
+                        cd "${WORKSPACE}/04-Jenkins/ci-pipeline"
+
+                        echo "🚀 docker compose up --wait (blocks until all healthchecks pass)..."
+                        docker compose \
+                            -f docker-compose.test.yml \
+                            --env-file .env.test \
+                            -p "ecommerce-ci-${BUILD_NUMBER}" \
+                            up --wait --timeout 120
+
+                        echo "✅ All containers healthy. Running smoke tests..."
+                    '''
+
+                    // Run smoke tests against the live stack
+                    sh '''
+                        set -euo pipefail
+                        cd "${WORKSPACE}/04-Jenkins/ci-pipeline"
+                        chmod +x "${WORKSPACE}/${SMOKE_SCRIPT}"
+
+                        # Export CI credentials so smoke-tests.sh can use them
+                        export CI_JWT_SECRET="${CI_JWT_SECRET}"
+                        export CI_INTERNAL_KEY="${CI_INTERNAL_KEY}"
+
+                        bash "${WORKSPACE}/${SMOKE_SCRIPT}"
+                    '''
+                }
+            }
+            post {
+                always {
+                    // ALWAYS tear down the test stack — whether tests pass or fail
+                    sh '''
+                        echo "🧹 Tearing down CI test stack..."
+                        cd "${WORKSPACE}/04-Jenkins/ci-pipeline" || true
+
+                        docker compose \
+                            -f docker-compose.test.yml \
+                            -p "ecommerce-ci-${BUILD_NUMBER}" \
+                            down --volumes --remove-orphans 2>/dev/null || true
+
+                        # Remove .env.test — secrets must not persist on disk
+                        rm -f .env.test
+
+                        echo "✅ CI test stack removed."
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 6 — TRIVY SECURITY SCAN
+        // Scans every image. CRITICAL ≥ 5 fails the pipeline.
+        // Reports archived as build artifacts + uploaded to S3.
+        // =====================================================================
+        stage('Trivy Security Scan') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        mkdir -p "${WORKSPACE}/reports/trivy"
+
+                        echo "🛡️  Pulling Trivy ${TRIVY_VERSION}..."
+                        docker pull "aquasec/trivy:${TRIVY_VERSION}"
+
+                        TOTAL_CRITICALS=0
+
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+                            IMAGE="${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+                            echo ""
+                            echo "🛡️  Scanning: $SVC_NAME"
+
+                            # JSON report (machine-readable for S3 / audit)
+                            docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v "${WORKSPACE}/reports/trivy:/reports" \
+                                "aquasec/trivy:${TRIVY_VERSION}" \
+                                image \
+                                --severity CRITICAL,HIGH \
+                                --format json \
+                                --output "/reports/${SVC_NAME}.json" \
+                                "${IMAGE}"
+
+                            # Table report (human-readable for PR description)
+                            docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v "${WORKSPACE}/reports/trivy:/reports" \
+                                "aquasec/trivy:${TRIVY_VERSION}" \
+                                image \
+                                --severity CRITICAL,HIGH \
+                                --format table \
+                                --output "/reports/${SVC_NAME}.txt" \
+                                "${IMAGE}"
+
+                            # Count CRITICAL findings
+                            CRITS=$(docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                "aquasec/trivy:${TRIVY_VERSION}" \
+                                image \
+                                --severity CRITICAL \
+                                --format json \
+                                "${IMAGE}" \
+                                | grep -o '"Severity":"CRITICAL"' | wc -l | tr -d ' ')
+
+                            echo "   CRITICAL findings: ${CRITS}"
+                            TOTAL_CRITICALS=$((TOTAL_CRITICALS + CRITS))
+
+                            if [ "${CRITS}" -ge 5 ]; then
+                                echo "❌ CRITICAL gate failed for ${SVC_NAME}: ${CRITS} findings (max 4)"
+                                exit 1
+                            fi
+
+                            echo "✅ Trivy passed: ${SVC_NAME} (${CRITS} CRITICAL)"
+                        done < /tmp/services.txt
+
+                        echo ""
+                        echo "✅ All Trivy scans passed. Total CRITICAL: ${TOTAL_CRITICALS}"
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/trivy/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 7 — GENERATE SBOM (CycloneDX format)
+        // Software Bill of Materials for every image.
+        // Uploaded to S3 + archived as build artifact.
+        // =====================================================================
+        stage('Generate SBOM') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+                        mkdir -p "${WORKSPACE}/reports/sbom"
+
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+                            IMAGE="${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+                            echo "📋 SBOM: $SVC_NAME"
+
+                            docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v "${WORKSPACE}/reports/sbom:/reports" \
+                                "aquasec/trivy:${TRIVY_VERSION}" \
+                                image \
+                                --format cyclonedx \
+                                --output "/reports/${SVC_NAME}-sbom.json" \
+                                "${IMAGE}"
+
+                        done < /tmp/services.txt
+
+                        echo "✅ SBOM generated for all services."
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/sbom/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 8 — PUSH TO ECR
+        // Only reached if ALL previous gates pass (sonar, tests, trivy).
+        // Creates ECR repo if it doesn't exist.
+        // Tags image with both IMAGE_TAG (ci-NNN) and RELEASE_VERSION (v0.1.NNN).
+        // =====================================================================
+        stage('Push to ECR') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "🔐 ECR login..."
+                        aws ecr get-login-password --region "${AWS_REGION}" | \
+                            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+                            CI_IMAGE="${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}"
+                            RELEASE_IMAGE="${ECR_REGISTRY}/${REPO}:${RELEASE_VERSION}"
+
+                            # Create ECR repo if missing
+                            aws ecr describe-repositories \
+                                --repository-names "${REPO}" \
+                                --region "${AWS_REGION}" >/dev/null 2>&1 || \
+                            aws ecr create-repository \
+                                --repository-name "${REPO}" \
+                                --image-scanning-configuration scanOnPush=true \
+                                --image-tag-mutability IMMUTABLE \
+                                --region "${AWS_REGION}" >/dev/null
+
+                            echo "📤 Pushing: $CI_IMAGE"
+                            docker push "${CI_IMAGE}"
+
+                            echo "🏷️  Re-tagging as release version: $RELEASE_IMAGE"
+                            docker tag "${CI_IMAGE}" "${RELEASE_IMAGE}"
+                            docker push "${RELEASE_IMAGE}"
+
+                            echo "✅ Pushed: ${SVC_NAME}"
+                        done < /tmp/services.txt
+
+                        echo ""
+                        echo "✅ All images pushed to ECR."
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 9 — ECR SCAN VERIFICATION
+        // Wait for ECR scan-on-push to complete and validate.
+        // =====================================================================
+        stage('ECR Scan Verification') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+
+                            echo "🔎 Waiting for ECR scan: $SVC_NAME..."
+
+                            STATUS="PENDING"
+                            for i in $(seq 1 30); do
+                                STATUS=$(aws ecr describe-image-scan-findings \
+                                    --repository-name "${REPO}" \
+                                    --image-id imageTag="${RELEASE_VERSION}" \
+                                    --region "${AWS_REGION}" \
+                                    --query "imageScanStatus.status" \
+                                    --output text 2>/dev/null || echo "PENDING")
+
+                                echo "  Attempt $i/30: $STATUS"
+                                [ "$STATUS" = "COMPLETE" ] && break
+                                [ "$STATUS" = "FAILED"   ] && { echo "❌ ECR scan failed"; exit 1; }
+                                sleep 10
+                            done
+
+                            [ "$STATUS" = "COMPLETE" ] || {
+                                echo "❌ ECR scan timed out for $SVC_NAME"
+                                exit 1
+                            }
+
+                            CRITS=$(aws ecr describe-image-scan-findings \
+                                --repository-name "${REPO}" \
+                                --image-id imageTag="${RELEASE_VERSION}" \
+                                --region "${AWS_REGION}" \
+                                --query "imageScanFindings.findingSeverityCounts.CRITICAL" \
+                                --output text 2>/dev/null || echo "0")
+
+                            CRITS=${CRITS:-0}
+                            [ "$CRITS" = "None" ] && CRITS=0
+
+                            echo "  ECR CRITICAL: $CRITS"
+
+                            if [ "${CRITS}" -ge 5 ]; then
+                                echo "❌ ECR CRITICAL gate failed: $SVC_NAME ($CRITS findings)"
+                                exit 1
+                            fi
+
+                            echo "✅ ECR scan passed: $SVC_NAME"
+                        done < /tmp/services.txt
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 10 — UPDATE IMAGE TAGS IN K8S DEPLOYMENT YAMLS
+        // Uses yq (v4) to patch the image field in each deployment file.
+        // The frontend deployment and all 6 service deployments are patched.
+        // WHY yq: safe YAML-aware editing — sed on YAML is fragile.
+        // =====================================================================
+        stage('Update K8s Image Tags') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "🔧 Patching K8s deployment image tags to ${RELEASE_VERSION}..."
+
+                        # Patch all backend service deployments
+                        while IFS= read -r SERVICE; do
+                            SVC_NAME=$(basename "$SERVICE")
+                            REPO="pip-project-ecommerce/${SVC_NAME}"
+                            NEW_IMAGE="${ECR_REGISTRY}/${REPO}:${RELEASE_VERSION}"
+                            DEPLOY_FILE="${WORKSPACE}/${K8S_SERVICES_DIR}/${SVC_NAME}/deployment.yaml"
+
+                            if [ -f "$DEPLOY_FILE" ]; then
+                                echo "  Patching: $SVC_NAME → $NEW_IMAGE"
+                                yq eval \
+                                    ".spec.template.spec.containers[0].image = \"${NEW_IMAGE}\"" \
+                                    -i "$DEPLOY_FILE"
+                                echo "  ✅ $SVC_NAME patched"
+                            else
+                                echo "  ⚠️  No deployment.yaml found for $SVC_NAME at $DEPLOY_FILE"
+                            fi
+                        done < /tmp/services.txt
+
+                        # Patch frontend deployment
+                        FRONTEND_DEPLOY="${WORKSPACE}/${K8S_FRONTEND_DIR}/deployment.yaml"
+                        FRONTEND_REPO="pip-project-ecommerce/frontend"
+                        FRONTEND_IMAGE="${ECR_REGISTRY}/${FRONTEND_REPO}:${RELEASE_VERSION}"
+
+                        if [ -f "$FRONTEND_DEPLOY" ]; then
+                            echo "  Patching: frontend → $FRONTEND_IMAGE"
+                            yq eval \
+                                ".spec.template.spec.containers[0].image = \"${FRONTEND_IMAGE}\"" \
+                                -i "$FRONTEND_DEPLOY"
+                            echo "  ✅ frontend patched"
+                        fi
+
+                        echo ""
+                        echo "✅ All K8s deployment image tags updated to ${RELEASE_VERSION}"
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 11 — COMMIT PATCHED YAMLS TO RELEASE BRANCH
+        // Creates release/<version> branch, commits the patched deployment
+        // files, pushes to GitHub.
+        // The PR raised in the next stage targets main.
+        // ArgoCD watches main — merge triggers automatic deployment.
+        // =====================================================================
+        stage('Commit & Push Release Branch') {
+            steps {
+                sshagent(credentials: ['github-ssh-key']) {
+                    sh '''
+                        set -euo pipefail
+
+                        git config user.email "jenkins@pip-project-ecommerce.ci"
+                        git config user.name  "Jenkins CI Pipeline"
+
+                        RELEASE_BRANCH="release/${RELEASE_VERSION}"
+
+                        echo "🌿 Creating branch: $RELEASE_BRANCH"
+                        git checkout -b "$RELEASE_BRANCH"
+
+                        # Stage all patched deployment YAMLs
+                        git add \
+                            "${K8S_SERVICES_DIR}/user-service/deployment.yaml" \
+                            "${K8S_SERVICES_DIR}/product-service/deployment.yaml" \
+                            "${K8S_SERVICES_DIR}/cart-service/deployment.yaml" \
+                            "${K8S_SERVICES_DIR}/order-service/deployment.yaml" \
+                            "${K8S_SERVICES_DIR}/payment-service/deployment.yaml" \
+                            "${K8S_SERVICES_DIR}/notification-service/deployment.yaml" \
+                            "${K8S_FRONTEND_DIR}/deployment.yaml"
+
+                        if git diff --cached --quiet; then
+                            echo "ℹ️  No image tag changes to commit (already up to date)."
+                        else
+                            git commit -m "release(${RELEASE_VERSION}): update K8s image tags [skip ci]
+
+Release: ${RELEASE_VERSION}
+Build:   #${BUILD_NUMBER}
+Commit:  ${GIT_SHA}
+Branch:  ${GIT_BRANCH_SAFE}
+
+Security gates passed:
+  ✅ SonarQube quality gate
+  ✅ Unit tests
+  ✅ Integration + smoke tests (full API flows)
+  ✅ Trivy scan (CRITICAL < 5 per image)
+  ✅ ECR scan-on-push
+
+Images updated in this commit:
+  ${ECR_REGISTRY}/pip-project-ecommerce/*:${RELEASE_VERSION}
+
+Next step: Review and merge this PR to main.
+ArgoCD will automatically deploy to EKS on merge."
+
+                            git push origin "$RELEASE_BRANCH"
+                            echo "✅ Pushed branch: $RELEASE_BRANCH"
+                        fi
+
+                        # Save branch name for PR creation stage
+                        echo "$RELEASE_BRANCH" > /tmp/release-branch.txt
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 12 — RAISE PR TO MAIN
+        // GitHub CLI creates the PR with a rich description including:
+        //   - what changed (image tags)
+        //   - which gates passed
+        //   - links to Trivy/SBOM artifacts
+        //   - instructions for reviewer
+        // Reviewer approves → merge → ArgoCD triggers → EKS deployed
+        // =====================================================================
+        stage('Raise PR to main') {
+            steps {
+                withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                    sh '''
+                        set -euo pipefail
+
+                        RELEASE_BRANCH=$(cat /tmp/release-branch.txt 2>/dev/null || echo "release/${RELEASE_VERSION}")
+
+                        # Check if branch was actually pushed (may be skipped if no changes)
+                        if ! git ls-remote --exit-code origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+                            echo "ℹ️  Branch $RELEASE_BRANCH not pushed — no PR needed."
+                            exit 0
+                        fi
+
+                        echo "📋 Creating PR: $RELEASE_BRANCH → main"
+
+                        # Build PR body with full context
+                        PR_BODY="## Release ${RELEASE_VERSION}
+
+**Build:** [#${BUILD_NUMBER}](${BUILD_URL})
+**Commit:** \`${GIT_SHA}\`
+**Source branch:** \`${GIT_BRANCH_SAFE}\`
+
+### What changed
+Updated ECR image tags in all K8s deployment manifests to \`${RELEASE_VERSION}\`.
+No code changes — all application logic is in the container images.
+
+### Security gates (all must pass before merge)
+| Gate | Status |
+|------|--------|
+| SonarQube SAST | ✅ Passed |
+| Unit tests | ✅ Passed |
+| Integration + smoke tests | ✅ Passed |
+| Trivy CRITICAL scan | ✅ Passed |
+| ECR scan-on-push | ✅ Passed |
+
+### Images in this release
+\`\`\`
+${ECR_REGISTRY}/pip-project-ecommerce/user-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/product-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/cart-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/order-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/payment-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/notification-service:${RELEASE_VERSION}
+${ECR_REGISTRY}/pip-project-ecommerce/frontend:${RELEASE_VERSION}
+\`\`\`
+
+### Reviewer checklist
+- [ ] Check Trivy scan report in build artifacts
+- [ ] Check SonarQube dashboard for new issues
+- [ ] Review smoke test output in Jenkins console
+- [ ] Confirm this release is ready for production
+
+### After merge
+ArgoCD will automatically detect the image tag change in \`main\` and
+sync the new deployment to the EKS cluster within ~3 minutes.
+Monitor: ArgoCD UI → ecommerce-app application.
+
+---
+*Raised automatically by Jenkins CI pipeline #${BUILD_NUMBER}*"
+
+                        gh pr create \
+                            --title "release(${RELEASE_VERSION}): deploy to production EKS" \
+                            --body "$PR_BODY" \
+                            --base main \
+                            --head "$RELEASE_BRANCH" \
+                            --label "release,automated-ci"
+
+                        # Capture PR URL for Slack notification
+                        PR_URL=$(gh pr view "$RELEASE_BRANCH" --json url -q .url 2>/dev/null || echo "${BUILD_URL}")
+                        echo "$PR_URL" > /tmp/pr-url.txt
+
+                        echo "✅ PR created: $PR_URL"
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 13 — UPLOAD ARTIFACTS TO S3
+        // Trivy reports + SBOM stored in the project logs bucket so they're
+        // available for compliance audit independently of Jenkins.
+        // =====================================================================
+        stage('Archive Artifacts to S3') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        # Get the logs bucket name from SSM
+                        LOGS_BUCKET=$(aws ssm get-parameter \
+                            --name "/pip-project-ecommerce/dev/s3/logs-bucket-name" \
+                            --query Parameter.Value \
+                            --output text 2>/dev/null || echo "")
+
+                        if [ -z "$LOGS_BUCKET" ]; then
+                            echo "⚠️  Logs bucket SSM param not found — skipping S3 upload."
+                            echo "    Run the infra pipeline first to create the bucket."
+                            exit 0
+                        fi
+
+                        S3_PREFIX="s3://${LOGS_BUCKET}/${ARTIFACTS_S3_PREFIX}/${RELEASE_VERSION}/build-${BUILD_NUMBER}"
+
+                        echo "📤 Uploading to: $S3_PREFIX"
+
+                        aws s3 cp "${WORKSPACE}/reports/trivy/" \
+                            "${S3_PREFIX}/trivy/" \
+                            --recursive --quiet
+
+                        aws s3 cp "${WORKSPACE}/reports/sbom/" \
+                            "${S3_PREFIX}/sbom/" \
+                            --recursive --quiet
+
+                        echo "✅ Artifacts uploaded to S3."
+                        echo "   Location: $S3_PREFIX"
+                    '''
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // POST — Slack notification with full result summary
+    // -------------------------------------------------------------------------
+    post {
+        success {
+            script {
+                def prUrl = sh(
+                    script: "cat /tmp/pr-url.txt 2>/dev/null || echo '${env.BUILD_URL}'",
+                    returnStdout: true
+                ).trim()
+
+                slackSend(
+                    channel: '#deployments',
+                    color: 'good',
+                    message: """
+✅ *CI Pipeline PASSED* — ${env.RELEASE_VERSION}
+Build     : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Commit    : \`${env.GIT_SHA}\` (${env.GIT_BRANCH_SAFE})
+Pull Request : <${prUrl}|Review & merge to deploy>
+Duration  : ${currentBuild.durationString}
+
+Security  : SonarQube ✅  Unit Tests ✅  Smoke Tests ✅  Trivy ✅  ECR Scan ✅
+Next step : Human review the PR → approve → merge → ArgoCD deploys to EKS
+                    """.stripIndent()
+                )
+            }
+        }
+
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: """
+❌ *CI Pipeline FAILED* — ${env.RELEASE_VERSION ?: 'unknown'}
+Build  : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Branch : ${env.GIT_BRANCH_SAFE ?: 'unknown'}
+Logs   : <${env.BUILD_URL}console|View Console Output>
+                """.stripIndent()
+            )
+        }
+
+        unstable {
+            slackSend(
+                channel: '#deployments',
+                color: 'warning',
+                message: """
+⚠️ *CI Pipeline UNSTABLE* — ${env.RELEASE_VERSION ?: 'unknown'}
+Build  : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Logs   : <${env.BUILD_URL}console|View Console Output>
+                """.stripIndent()
+            )
+        }
+
+        always {
+            // Clean workspace — remove any .env files or credentials that landed on disk
+            sh '''
+                rm -f 04-Jenkins/ci-pipeline/.env.test || true
+                rm -f /tmp/services.txt /tmp/release-branch.txt /tmp/pr-url.txt || true
+            '''
+            cleanWs()
+        }
+    }
+}

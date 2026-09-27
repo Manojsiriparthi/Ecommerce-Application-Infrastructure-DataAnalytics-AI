@@ -1,0 +1,872 @@
+// =============================================================================
+// pip-project-ecommerce — INFRASTRUCTURE PIPELINE
+// =============================================================================
+//
+// COMPLETE FLOW (all stages explained):
+//
+//  ┌── DEV APPLY (TF_ACTION=apply, ENVIRONMENT=dev) ────────────────────────┐
+//  │  1.  Checkout                  wipe + fetch repo                        │
+//  │  2.  Validate Params           check passwords not empty                 │
+//  │  3.  Terraform Init            init backend + providers                  │
+//  │  4.  Terraform Validate        syntax + type check                       │
+//  │  5.  Terraform Plan            save plan file, archive as artifact        │
+//  │  6.  Manual Approval           human reads plan → approves               │
+//  │  7.  Terraform Apply           apply saved plan, write tf-outputs.json   │
+//  │  8.  Patch K8s Manifests       sed-replace all <PLACEHOLDER> tokens       │
+//  │                                using terraform outputs + SSM values       │
+//  │  9.  Commit Patched Files      push to infra-applied/<env> branch        │
+//  │  10. Update Kubeconfig         aws eks update-kubeconfig                 │
+//  │  11. Bootstrap ArgoCD          run install-argocd.sh (idempotent)        │
+//  │  12. Deploy to Dev EKS         kubectl apply all K8s manifests           │
+//  │                                wait for all Deployments rollout          │
+//  │                                wait for ALB Ingresses to get DNS         │
+//  │  13. EKS Smoke Tests           run smoke-tests.sh via port-forward       │
+//  │                                (tests hit real Aurora + real Redis)       │
+//  │                                if ANY test fails → pipeline fails         │
+//  │  14. Update Route53 A-records  re-apply TF with real alb_dns_name        │
+//  │                                (second targeted apply fills DNS)          │
+//  │  15. Slack ✅                                                             │
+//  └────────────────────────────────────────────────────────────────────────┘
+//
+//  ┌── PROD APPLY (TF_ACTION=apply, ENVIRONMENT=prod) ──────────────────────┐
+//  │  Same stages 1-10, then:                                                │
+//  │  11. Bootstrap ArgoCD on prod cluster                                   │
+//  │  12. Route53 second apply (fill alb_dns_name)                           │
+//  │  NOTE: No smoke tests on prod — same images already proven on dev.      │
+//  │        ArgoCD deploys after the CI PR is approved and merged to main.   │
+//  └────────────────────────────────────────────────────────────────────────┘
+//
+//  ┌── DESTROY DEV (DESTROY_DEV_AFTER_PROD=true, ENVIRONMENT=dev) ──────────┐
+//  │  Runs only when:                                                        │
+//  │    - TF_ACTION = destroy                                                │
+//  │    - ENVIRONMENT = dev                                                  │
+//  │  Stages: plan destroy → manual approval → terraform destroy             │
+//  │  Purpose: tear down dev after prod is confirmed live = cost saving      │
+//  └────────────────────────────────────────────────────────────────────────┘
+//
+// PASSWORD LIFECYCLE:
+//   ┌──────────────────────────────────────────────────────────────────────┐
+//   │ First apply: operator types each password as a Jenkins parameter.    │
+//   │ Terraform stores every value in Secrets Manager / SSM SecureString.  │
+//   │ All subsequent applies: Terraform reads from Secrets Manager.        │
+//   │ Operator never types them again.                                     │
+//   │                                                                      │
+//   │ Why still ask on each run:                                           │
+//   │ Terraform reconciles state — it needs to KNOW the value even if      │
+//   │ it won't change it. The TF_VAR_* injection passes it in memory,      │
+//   │ it never appears in the plan file or Jenkins console.                │
+//   │ Alternative: store in Jenkins credentials and skip the param —       │
+//   │ use Jenkins credential binding instead of params for zero-touch.     │
+//   └──────────────────────────────────────────────────────────────────────┘
+//
+// JENKINS PREREQUISITES:
+//   Credentials (Manage Jenkins → Credentials):
+//     aws-credentials    AWS Access Key + Secret  (type: AWS Credentials)
+//     github-ssh-key     SSH private key          (type: SSH Username + Private Key)
+//     slack-webhook      Slack webhook URL        (type: Secret text)
+//
+//   Plugins: Pipeline, AWS Steps, Git, Slack Notification, AnsiColor,
+//            Timestamper, SSH Agent, Credentials Binding
+//
+//   Agent label "infra" must have:
+//     terraform 1.7+, aws cli v2, kubectl, helm, git,
+//     jq, curl, sed, bash
+// =============================================================================
+
+pipeline {
+
+    agent { label 'infra' }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 120, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    // -------------------------------------------------------------------------
+    // PARAMETERS
+    // -------------------------------------------------------------------------
+    parameters {
+
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'prod'],
+            description: '''
+Which environment to target.
+  dev  → ap-south-1 (Mumbai)
+  prod → us-east-1  (N. Virginia)
+            '''.stripIndent()
+        )
+
+        choice(
+            name: 'TF_ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: '''
+plan    → show changes only, no resources touched
+apply   → create / update infrastructure (manual approval required)
+destroy → tear down all resources (manual approval required)
+            '''.stripIndent()
+        )
+
+        // ── Sensitive parameters ──────────────────────────────────────────
+        // Entered ONCE on first apply. Terraform stores them in Secrets Manager.
+        // On every subsequent apply they are passed the same way but Terraform
+        // sees no change and leaves the secrets untouched.
+        password(
+            name: 'DB_MASTER_PASSWORD',
+            defaultValue: '',
+            description: '''[SENSITIVE] Aurora master password.
+Min 8 chars. No @ / " characters.
+STORED IN: Secrets Manager → pip-project-ecommerce-db-credentials
+After first apply: Terraform reads it from Secrets Manager automatically.'''
+        )
+
+        password(
+            name: 'JWT_SECRET',
+            defaultValue: '',
+            description: '''[SENSITIVE] JWT signing secret shared by all services.
+Min 32 chars. Used to sign + verify Bearer tokens.
+STORED IN: SSM Parameter Store → SecureString (KMS encrypted)'''
+        )
+
+        password(
+            name: 'INTERNAL_SERVICE_KEY',
+            defaultValue: '',
+            description: '''[SENSITIVE] Key for /internal/* service-to-service calls.
+Min 32 chars. Sent as X-Internal-Key header between services.
+STORED IN: SSM Parameter Store → SecureString (KMS encrypted)'''
+        )
+
+        password(
+            name: 'REDIS_AUTH_TOKEN',
+            defaultValue: '',
+            description: '''[SENSITIVE] ElastiCache Redis AUTH password.
+16-128 alphanumeric + special chars.
+STORED IN: Secrets Manager → pip-project-ecommerce/.../redis/auth-token'''
+        )
+
+        // ── Non-sensitive parameters ──────────────────────────────────────
+        string(
+            name: 'SES_FROM_EMAIL',
+            defaultValue: 'noreply@ecommerce-pip.com',
+            description: 'SES verified sender email. Must be verified in SES console before first use.'
+        )
+
+        string(
+            name: 'DOMAIN_NAME',
+            defaultValue: 'ecommerce-pip.com',
+            description: '''Root domain for Route53 + ACM.
+Must be registered (Route53 Domains or another registrar).
+Terraform creates the hosted zone, cert, and A-records automatically.'''
+        )
+    }
+
+    environment {
+        PROJECT_NAME    = 'pip-project-ecommerce'
+        AWS_REGION_DEV  = 'ap-south-1'
+        AWS_REGION_PROD = 'us-east-1'
+
+        TF_DIR_DEV      = '01-Infrastructure/environments/dev'
+        TF_DIR_PROD     = '01-Infrastructure/environments/prod'
+
+        K8S_FRONTEND_INGRESS = '03-Kubernetes/frontend/ingress.yaml'
+        K8S_INTERNAL_INGRESS = '03-Kubernetes/services/ingress-internal.yaml'
+        K8S_CONFIGMAP        = '03-Kubernetes/secrets/configmap-app.yaml'
+        K8S_ARGOCD_INSTALL   = '03-Kubernetes/argocd/install-argocd.sh'
+        SMOKE_SCRIPT         = '04-Jenkins/ci-pipeline/smoke-tests.sh'
+
+        TF_LOG           = 'WARN'
+        TF_INPUT         = 'false'
+        TF_IN_AUTOMATION = 'true'
+    }
+
+    stages {
+
+        // =====================================================================
+        // STAGE 1 — CHECKOUT
+        // =====================================================================
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+                script {
+                    // Resolve the AWS region once for the whole pipeline
+                    env.AWS_REGION = params.ENVIRONMENT == 'prod'
+                        ? env.AWS_REGION_PROD
+                        : env.AWS_REGION_DEV
+
+                    env.TF_WORKING_DIR = params.ENVIRONMENT == 'prod'
+                        ? env.TF_DIR_PROD
+                        : env.TF_DIR_DEV
+
+                    env.TF_VARS_FILE = "${params.ENVIRONMENT}.tfvars"
+
+                    echo "✅ Checkout complete"
+                    echo "   Environment : ${params.ENVIRONMENT}"
+                    echo "   Action      : ${params.TF_ACTION}"
+                    echo "   AWS Region  : ${env.AWS_REGION}"
+                }
+                sh 'git log --oneline -3'
+            }
+        }
+
+        // =====================================================================
+        // STAGE 2 — VALIDATE PARAMETERS
+        // =====================================================================
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (params.TF_ACTION in ['apply', 'destroy']) {
+                        ['DB_MASTER_PASSWORD', 'JWT_SECRET',
+                         'INTERNAL_SERVICE_KEY', 'REDIS_AUTH_TOKEN'].each { p ->
+                            if (!params[p]?.trim()) {
+                                error("${p} is required for ${params.TF_ACTION}")
+                            }
+                        }
+                    }
+                    if (params.TF_ACTION == 'apply' && !params.DOMAIN_NAME?.trim()) {
+                        error("DOMAIN_NAME is required for apply")
+                    }
+                    echo "✅ Parameters valid"
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 3 — TERRAFORM INIT
+        // =====================================================================
+        stage('Terraform Init') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        sh '''
+                            echo "🔧 terraform init..."
+                            terraform init -upgrade -reconfigure
+                            terraform version
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 4 — TERRAFORM VALIDATE
+        // =====================================================================
+        stage('Terraform Validate') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        sh 'terraform validate && echo "✅ Configuration valid."'
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 5 — TERRAFORM PLAN
+        // Saves plan to tfplan.binary. Human reads tfplan.txt artifact.
+        // Using a saved plan guarantees Apply executes exactly what was approved.
+        // =====================================================================
+        stage('Terraform Plan') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        withEnv([
+                            "TF_VAR_db_master_password=${params.DB_MASTER_PASSWORD}",
+                            "TF_VAR_jwt_secret=${params.JWT_SECRET}",
+                            "TF_VAR_internal_service_key=${params.INTERNAL_SERVICE_KEY}",
+                            "TF_VAR_redis_auth_token=${params.REDIS_AUTH_TOKEN}",
+                            "TF_VAR_ses_from_email=${params.SES_FROM_EMAIL}",
+                            "TF_VAR_domain_name=${params.DOMAIN_NAME}"
+                        ]) {
+                            sh '''
+                                echo "📋 Running terraform plan..."
+
+                                FLAGS="-var-file=${TF_VARS_FILE}"
+                                [ "${TF_ACTION}" = "destroy" ] && FLAGS="${FLAGS} -destroy"
+
+                                terraform plan ${FLAGS} -out=tfplan.binary
+                                terraform show -no-color tfplan.binary > tfplan.txt
+
+                                echo "✅ Plan complete. Last 20 lines:"
+                                tail -20 tfplan.txt
+                            '''
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: "${env.TF_WORKING_DIR}/tfplan.txt",
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 6 — MANUAL APPROVAL
+        // Skipped for plan-only runs.
+        // Slack message includes a direct link to the plan artifact.
+        // =====================================================================
+        stage('Manual Approval') {
+            when { expression { params.TF_ACTION in ['apply', 'destroy'] } }
+            steps {
+                script {
+                    def icon   = params.TF_ACTION == 'destroy' ? '🔴 DESTROY' : '🟢 APPLY'
+                    def color  = params.TF_ACTION == 'destroy' ? 'danger' : 'warning'
+                    def planUrl = "${env.BUILD_URL}artifact/${env.TF_WORKING_DIR}/tfplan.txt"
+
+                    slackSend(
+                        channel: '#deployments',
+                        color: color,
+                        message: """
+*${icon} — Approval Required*
+Environment : *${params.ENVIRONMENT}*
+Pipeline    : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Terraform plan : <${planUrl}|View plan>
+Review the plan then approve in Jenkins (30 min timeout).
+                        """.stripIndent()
+                    )
+
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: "${icon} ${params.ENVIRONMENT}? Review plan: ${planUrl}",
+                            ok: "Yes — ${params.TF_ACTION} ${params.ENVIRONMENT}"
+                        )
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 7 — TERRAFORM APPLY
+        // =====================================================================
+        stage('Terraform Apply') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        withEnv([
+                            "TF_VAR_db_master_password=${params.DB_MASTER_PASSWORD}",
+                            "TF_VAR_jwt_secret=${params.JWT_SECRET}",
+                            "TF_VAR_internal_service_key=${params.INTERNAL_SERVICE_KEY}",
+                            "TF_VAR_redis_auth_token=${params.REDIS_AUTH_TOKEN}",
+                            "TF_VAR_ses_from_email=${params.SES_FROM_EMAIL}",
+                            "TF_VAR_domain_name=${params.DOMAIN_NAME}"
+                        ]) {
+                            sh '''
+                                echo "🚀 terraform apply..."
+                                terraform apply -auto-approve tfplan.binary
+                                echo "✅ Terraform apply complete."
+
+                                # Write all outputs to JSON for downstream stages
+                                terraform output -json > ../../tf-outputs.json
+                                echo "📋 Outputs written to tf-outputs.json"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 8 — TERRAFORM DESTROY
+        // =====================================================================
+        stage('Terraform Destroy') {
+            when { expression { params.TF_ACTION == 'destroy' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        withEnv([
+                            "TF_VAR_db_master_password=${params.DB_MASTER_PASSWORD}",
+                            "TF_VAR_jwt_secret=${params.JWT_SECRET}",
+                            "TF_VAR_internal_service_key=${params.INTERNAL_SERVICE_KEY}",
+                            "TF_VAR_redis_auth_token=${params.REDIS_AUTH_TOKEN}",
+                            "TF_VAR_ses_from_email=${params.SES_FROM_EMAIL}",
+                            "TF_VAR_domain_name=${params.DOMAIN_NAME}"
+                        ]) {
+                            sh '''
+                                echo "🔴 terraform destroy..."
+                                terraform apply -auto-approve tfplan.binary
+                                echo "✅ Environment ${ENVIRONMENT} destroyed."
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 9 — PATCH K8S MANIFESTS
+        // Reads real values from Terraform outputs and SSM.
+        // Replaces every <PLACEHOLDER> in K8s YAML files with actual values.
+        // After this stage the manifests are ready to apply to EKS.
+        // =====================================================================
+        stage('Patch K8s Manifests') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+                        TF_OUT="01-Infrastructure/tf-outputs.json"
+                        ENV="${ENVIRONMENT}"
+                        PROJECT="pip-project-ecommerce"
+
+                        # ── Read values from SSM (guaranteed to exist after apply) ──
+                        ssm() {
+                            aws ssm get-parameter \
+                                --name "$1" --query Parameter.Value \
+                                --output text --region "${AWS_REGION}"
+                        }
+
+                        WAF_ARN=$(ssm "/${PROJECT}/${ENV}/waf/web-acl-arn")
+                        LOGS_BUCKET=$(ssm "/${PROJECT}/${ENV}/s3/logs-bucket-name")
+                        REDIS_HOST=$(ssm "/${PROJECT}/${ENV}/redis/primary-endpoint")
+                        ACM_CERT_ARN=$(ssm "/${PROJECT}/${ENV}/acm/certificate-arn")
+                        SNS_ARN=$(ssm "/${PROJECT}/${ENV}/sns/topic-arn" 2>/dev/null || echo "")
+
+                        # ── Subnet IDs ────────────────────────────────────────────
+                        PUB_IDS=$(aws ec2 describe-subnets \
+                            --filters \
+                              "Name=tag:Name,Values=${PROJECT}-public-*" \
+                              "Name=tag:Environment,Values=${ENV}" \
+                            --query "Subnets[*].SubnetId" \
+                            --output text --region "${AWS_REGION}" | tr '\t' ',')
+
+                        PRIV_IDS=$(aws ec2 describe-subnets \
+                            --filters \
+                              "Name=tag:Name,Values=${PROJECT}-private-*" \
+                              "Name=tag:Environment,Values=${ENV}" \
+                            --query "Subnets[*].SubnetId" \
+                            --output text --region "${AWS_REGION}" | tr '\t' ',')
+
+                        PUB1=$(echo "$PUB_IDS"  | cut -d, -f1)
+                        PUB2=$(echo "$PUB_IDS"  | cut -d, -f2)
+                        PUB3=$(echo "$PUB_IDS"  | cut -d, -f3)
+                        PRIV1=$(echo "$PRIV_IDS" | cut -d, -f1)
+                        PRIV2=$(echo "$PRIV_IDS" | cut -d, -f2)
+                        PRIV3=$(echo "$PRIV_IDS" | cut -d, -f3)
+
+                        echo "WAF ARN       : ${WAF_ARN}"
+                        echo "Logs bucket   : ${LOGS_BUCKET}"
+                        echo "ACM cert ARN  : ${ACM_CERT_ARN}"
+                        echo "Redis host    : ${REDIS_HOST}"
+                        echo "Public subnets: ${PUB_IDS}"
+                        echo "Private subs  : ${PRIV_IDS}"
+
+                        # ── External ALB Ingress ─────────────────────────────────
+                        sed -i "s|<WAF_WEBACL_ARN>|${WAF_ARN}|g"       "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|<ACM_CERT_ARN>|${ACM_CERT_ARN}|g"    "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g" "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|yourdomain\\.com|${DOMAIN_NAME}|g"   "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|<PUBLIC_SUBNET_ID_1>|${PUB1}|g"      "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|<PUBLIC_SUBNET_ID_2>|${PUB2}|g"      "${K8S_FRONTEND_INGRESS}"
+                        sed -i "s|<PUBLIC_SUBNET_ID_3>|${PUB3}|g"      "${K8S_FRONTEND_INGRESS}"
+
+                        # ── Internal ALB Ingress ─────────────────────────────────
+                        sed -i "s|<PRIVATE_SUBNET_ID_1>|${PRIV1}|g"    "${K8S_INTERNAL_INGRESS}"
+                        sed -i "s|<PRIVATE_SUBNET_ID_2>|${PRIV2}|g"    "${K8S_INTERNAL_INGRESS}"
+                        sed -i "s|<PRIVATE_SUBNET_ID_3>|${PRIV3}|g"    "${K8S_INTERNAL_INGRESS}"
+                        sed -i "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g" "${K8S_INTERNAL_INGRESS}"
+
+                        # ── App ConfigMap ────────────────────────────────────────
+                        sed -i "s|<REDIS_PRIMARY_ENDPOINT>|${REDIS_HOST}|g"    "${K8S_CONFIGMAP}"
+                        sed -i "s|<SNS_TOPIC_ARN>|${SNS_ARN}|g"               "${K8S_CONFIGMAP}"
+                        sed -i "s|noreply@yourdomain\\.com|${SES_FROM_EMAIL}|g" "${K8S_CONFIGMAP}"
+
+                        echo "✅ All K8s manifests patched."
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 10 — COMMIT PATCHED MANIFESTS
+        // Pushes to infra-applied/<env>-<timestamp> branch so changes
+        // flow through a PR to main (no direct push to main).
+        // =====================================================================
+        stage('Commit Patched Manifests') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                sshagent(credentials: ['github-ssh-key']) {
+                    sh '''
+                        set -euo pipefail
+                        git config user.email "jenkins-infra@pip-project-ecommerce.ci"
+                        git config user.name  "Jenkins Infra Pipeline"
+
+                        BRANCH="infra-applied/${ENVIRONMENT}-$(date +%Y%m%d-%H%M%S)"
+                        git checkout -b "$BRANCH"
+
+                        git add \
+                            "${K8S_FRONTEND_INGRESS}" \
+                            "${K8S_INTERNAL_INGRESS}" \
+                            "${K8S_CONFIGMAP}"
+
+                        if git diff --cached --quiet; then
+                            echo "ℹ️  No changes to commit."
+                        else
+                            git commit -m "infra(${ENVIRONMENT}): patch K8s manifests [skip ci]
+
+Pipeline #${BUILD_NUMBER} | ${ENVIRONMENT} apply
+Replaced: WAF ARN, ACM cert ARN, subnet IDs, logs bucket,
+          Redis endpoint, SNS ARN, SES email, domain name"
+
+                            git push origin "$BRANCH"
+                            echo "✅ Pushed: $BRANCH"
+                            echo "   → Open PR from $BRANCH to main."
+                        fi
+
+                        # Save branch for reference
+                        echo "$BRANCH" > /tmp/infra-branch.txt
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 11 — UPDATE KUBECONFIG
+        // =====================================================================
+        stage('Update Kubeconfig') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        echo "🔧 Updating kubeconfig for ${ENVIRONMENT} cluster..."
+                        aws eks update-kubeconfig \
+                            --name "pip-project-ecommerce-cluster" \
+                            --region "${AWS_REGION}"
+
+                        echo "✅ Kubeconfig updated."
+                        kubectl cluster-info
+                        kubectl get nodes -o wide
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 12 — BOOTSTRAP ARGOCD (idempotent)
+        // Runs install-argocd.sh which uses `helm upgrade --install`
+        // so it is safe to run on every apply — if ArgoCD is already
+        // installed it updates it to the pinned version, otherwise installs.
+        // =====================================================================
+        stage('Bootstrap ArgoCD') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        echo "🎯 Bootstrapping ArgoCD on ${ENVIRONMENT} cluster..."
+                        chmod +x "${K8S_ARGOCD_INSTALL}"
+                        bash "${K8S_ARGOCD_INSTALL}"
+                        echo "✅ ArgoCD ready."
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 13 — DEPLOY K8S MANIFESTS TO EKS
+        // kubectl apply all manifests recursively (same thing ArgoCD will do
+        // on subsequent deploys, but we do it manually here for the first time).
+        // Then wait for all Deployments to complete rollout.
+        // =====================================================================
+        stage('Deploy to EKS') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "📦 Applying K8s manifests to ${ENVIRONMENT} EKS cluster..."
+
+                        # Apply in order: namespace → secrets → services → frontend → ingresses
+                        kubectl apply -f 03-Kubernetes/namespace.yaml
+
+                        # Secrets and config first (pods need these to start)
+                        kubectl apply -f 03-Kubernetes/secrets/
+
+                        # Backend services
+                        kubectl apply -f 03-Kubernetes/services/ --recursive
+
+                        # Frontend
+                        kubectl apply -f 03-Kubernetes/frontend/
+
+                        echo "⏳ Waiting for all Deployments to roll out..."
+                        TIMEOUT=600   # 10 minutes
+
+                        for deploy in \
+                            user-service \
+                            product-service \
+                            cart-service \
+                            order-service \
+                            payment-service \
+                            notification-service \
+                            frontend-deployment
+                        do
+                            echo "  Waiting for: $deploy"
+                            kubectl rollout status deployment/"$deploy" \
+                                --namespace ecommerce \
+                                --timeout="${TIMEOUT}s" || {
+                                echo "❌ Deployment $deploy did not become ready in time."
+                                kubectl describe deployment "$deploy" -n ecommerce
+                                kubectl get pods -n ecommerce -l "app=$deploy"
+                                exit 1
+                            }
+                        done
+
+                        echo ""
+                        echo "✅ All deployments ready."
+                        kubectl get pods -n ecommerce -o wide
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 14 — EKS SMOKE TESTS (dev only)
+        // =======================================================================
+        // WHY THIS IS BETTER THAN DOCKER COMPOSE TESTS:
+        //   Docker Compose tests (CI pipeline) verify the IMAGE works.
+        //   EKS smoke tests (this stage) verify the FULL SYSTEM works:
+        //     ✅ Real Aurora PostgreSQL (via RDS Proxy)
+        //     ✅ Real ElastiCache Redis (TLS + auth)
+        //     ✅ Real AWS Secrets Manager credentials (IRSA + CSI driver)
+        //     ✅ Real SNS topic (notification events published)
+        //     ✅ Real inter-service calls across ALB + ClusterIP
+        //     ✅ Real Ingress routing (ALB → frontend / services)
+        //
+        // HOW IT WORKS:
+        //   Uses kubectl port-forward to expose each service locally.
+        //   Runs the same smoke-tests.sh script (re-used from CI pipeline).
+        //   Port-forwards are cleaned up in the post{} block.
+        // =======================================================================
+        stage('EKS Smoke Tests') {
+            when {
+                allOf {
+                    expression { params.TF_ACTION == 'apply' }
+                    expression { params.ENVIRONMENT == 'dev' }
+                }
+            }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    sh '''
+                        set -euo pipefail
+
+                        echo "🧪 Starting EKS smoke tests against live dev cluster..."
+                        echo ""
+                        echo "WHY: Same images, but now tested with:"
+                        echo "  - Real Aurora RDS (not local Postgres)"
+                        echo "  - Real ElastiCache Redis (not skipped)"
+                        echo "  - Real Secrets Manager credentials (IRSA + CSI)"
+                        echo "  - Real ALB routing + VPC networking"
+
+                        # ── Start port-forwards in background ────────────────────
+                        # Each service is forwarded to a local port for smoke-tests.sh
+                        kubectl port-forward svc/user-service         4001:4001 -n ecommerce &
+                        kubectl port-forward svc/product-service      4002:4002 -n ecommerce &
+                        kubectl port-forward svc/cart-service         4003:4003 -n ecommerce &
+                        kubectl port-forward svc/order-service        4004:4004 -n ecommerce &
+                        kubectl port-forward svc/payment-service      4005:4005 -n ecommerce &
+                        kubectl port-forward svc/notification-service 4006:4006 -n ecommerce &
+
+                        # Save PIDs so we can kill them in post{}
+                        jobs -p > /tmp/port-forward-pids.txt
+                        echo "Port-forward PIDs: $(cat /tmp/port-forward-pids.txt)"
+
+                        # Wait for port-forwards to be ready
+                        echo "⏳ Waiting for port-forwards to establish..."
+                        sleep 15
+
+                        # Verify each port is responding before running tests
+                        for port in 4001 4002 4003 4004 4005 4006; do
+                            echo "  Checking port $port..."
+                            for i in $(seq 1 12); do
+                                if curl -sf --max-time 3 "http://localhost:${port}/health" \
+                                    > /dev/null 2>&1; then
+                                    echo "    ✅ Port $port ready"
+                                    break
+                                fi
+                                [ $i -eq 12 ] && {
+                                    echo "    ❌ Port $port not responding after 60s"
+                                    kubectl get pods -n ecommerce
+                                    kubectl logs -n ecommerce \
+                                        -l "app=$(kubectl get svc -n ecommerce \
+                                            -o jsonpath='{.items[?(@.spec.ports[0].port==${port})].metadata.name}')" \
+                                        --tail=50 || true
+                                    exit 1
+                                }
+                                sleep 5
+                            done
+                        done
+
+                        echo ""
+                        echo "🚀 All services reachable. Running smoke tests..."
+                        chmod +x "${SMOKE_SCRIPT}"
+                        bash "${SMOKE_SCRIPT}"
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh '''
+                        echo "🧹 Stopping port-forwards..."
+                        if [ -f /tmp/port-forward-pids.txt ]; then
+                            while IFS= read -r pid; do
+                                kill "$pid" 2>/dev/null || true
+                            done < /tmp/port-forward-pids.txt
+                            rm -f /tmp/port-forward-pids.txt
+                        fi
+                        # Belt-and-suspenders: kill any lingering kubectl port-forwards
+                        pkill -f "kubectl port-forward" 2>/dev/null || true
+                        echo "✅ Port-forwards stopped."
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 15 — UPDATE ROUTE53 A-RECORDS
+        // =======================================================================
+        // After the Ingress is applied and the ALB is provisioned (happens in
+        // Stage 13), we read the ALB DNS name and run a targeted terraform apply
+        // to create the Route53 A-alias records pointing to the real ALB.
+        //
+        // WHY A SECOND APPLY:
+        //   The ALB DNS name is assigned by AWS when the Ingress is first applied.
+        //   Terraform doesn't know it at initial apply time (it's a Kubernetes
+        //   resource, not a Terraform resource). So:
+        //     Apply 1 (Stage 7): creates everything except A-records (alb_dns_name="")
+        //     Apply 2 (Stage 15): fills alb_dns_name, creates A-records
+        //   After this, the domain resolves correctly with HTTPS via ACM cert.
+        // =======================================================================
+        stage('Update Route53 A-Records') {
+            when { expression { params.TF_ACTION == 'apply' } }
+            steps {
+                withAWS(credentials: 'aws-credentials', region: env.AWS_REGION) {
+                    dir(env.TF_WORKING_DIR) {
+                        withEnv([
+                            "TF_VAR_db_master_password=${params.DB_MASTER_PASSWORD}",
+                            "TF_VAR_jwt_secret=${params.JWT_SECRET}",
+                            "TF_VAR_internal_service_key=${params.INTERNAL_SERVICE_KEY}",
+                            "TF_VAR_redis_auth_token=${params.REDIS_AUTH_TOKEN}",
+                            "TF_VAR_ses_from_email=${params.SES_FROM_EMAIL}",
+                            "TF_VAR_domain_name=${params.DOMAIN_NAME}"
+                        ]) {
+                            sh '''
+                                set -euo pipefail
+
+                                echo "🔍 Reading ALB DNS from Ingress status..."
+
+                                ALB_DNS=$(kubectl get ingress frontend-external-ingress \
+                                    -n ecommerce \
+                                    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+                                    2>/dev/null || echo "")
+
+                                if [ -z "${ALB_DNS}" ]; then
+                                    echo "⚠️  ALB not yet provisioned — waiting up to 5 minutes..."
+                                    for i in $(seq 1 30); do
+                                        ALB_DNS=$(kubectl get ingress frontend-external-ingress \
+                                            -n ecommerce \
+                                            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+                                            2>/dev/null || echo "")
+                                        [ -n "${ALB_DNS}" ] && break
+                                        echo "  Attempt $i/30: ALB not ready yet..."
+                                        sleep 10
+                                    done
+                                fi
+
+                                if [ -z "${ALB_DNS}" ]; then
+                                    echo "⚠️  ALB DNS still not available. Skipping Route53 update."
+                                    echo "    Run the pipeline again once the ALB is provisioned."
+                                    exit 0
+                                fi
+
+                                echo "✅ ALB DNS: ${ALB_DNS}"
+
+                                # Store ALB DNS in SSM for future reference
+                                aws ssm put-parameter \
+                                    --name "/pip-project-ecommerce/${ENVIRONMENT}/alb/external-dns" \
+                                    --value "${ALB_DNS}" \
+                                    --type String \
+                                    --overwrite \
+                                    --region "${AWS_REGION}"
+
+                                echo "🌐 Running targeted terraform apply to create Route53 A-records..."
+                                terraform apply \
+                                    -var-file="${TF_VARS_FILE}" \
+                                    -var "alb_dns_name=${ALB_DNS}" \
+                                    -target module.route53_acm.aws_route53_record.apex \
+                                    -target module.route53_acm.aws_route53_record.www \
+                                    -auto-approve
+
+                                echo "✅ Route53 A-records created."
+                                echo "   ${DOMAIN_NAME}     → ${ALB_DNS}"
+                                echo "   www.${DOMAIN_NAME} → ${ALB_DNS}"
+                                echo ""
+                                echo "DNS propagation takes 1-3 minutes."
+                                echo "Test: nslookup ${DOMAIN_NAME}"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // POST — Slack notification + workspace cleanup
+    // -------------------------------------------------------------------------
+    post {
+        success {
+            script {
+                def extraMsg = ''
+                if (params.TF_ACTION == 'apply' && params.ENVIRONMENT == 'dev') {
+                    extraMsg = '\nDev EKS smoke tests: ✅ PASSED\nReady to run prod apply.'
+                } else if (params.TF_ACTION == 'apply' && params.ENVIRONMENT == 'prod') {
+                    extraMsg = '\nProd EKS ready. Approve the CI PR to deploy via ArgoCD.\nThen destroy dev to save cost.'
+                } else if (params.TF_ACTION == 'destroy') {
+                    extraMsg = "\n${params.ENVIRONMENT} environment destroyed. Resources freed."
+                }
+
+                slackSend(
+                    channel: '#deployments',
+                    color: 'good',
+                    message: """
+✅ *Infra Pipeline PASSED*
+Environment : *${params.ENVIRONMENT}*
+Action      : *${params.TF_ACTION}*
+Pipeline    : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Duration    : ${currentBuild.durationString}${extraMsg}
+                    """.stripIndent()
+                )
+            }
+        }
+
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: """
+❌ *Infra Pipeline FAILED*
+Environment : *${params.ENVIRONMENT}*
+Action      : *${params.TF_ACTION}*
+Pipeline    : <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Logs        : <${env.BUILD_URL}console|View console>
+                """.stripIndent()
+            )
+        }
+
+        always {
+            sh '''
+                # Kill any lingering kubectl port-forwards
+                pkill -f "kubectl port-forward" 2>/dev/null || true
+                rm -f /tmp/port-forward-pids.txt /tmp/infra-branch.txt || true
+            '''
+            cleanWs()
+        }
+    }
+}

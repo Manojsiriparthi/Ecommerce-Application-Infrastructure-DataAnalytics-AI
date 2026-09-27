@@ -1,0 +1,172 @@
+# =============================================================================
+# ArgoCD Helm values — pip-project-ecommerce
+# =============================================================================
+# Applied by install-argocd.sh via:
+#   helm upgrade --install argocd argo/argo-cd \
+#     --values argocd-values.yaml
+#
+# KEY DECISIONS:
+#   server.service.type: ClusterIP
+#     ArgoCD server is NOT exposed via LoadBalancer (no public IP).
+#     Access via kubectl port-forward or through the bastion.
+#     This avoids creating an unnecessary internet-facing load balancer.
+#
+#   configs.params."server.insecure": true
+#     TLS termination is handled at the ALB/bastion level.
+#     Internal ArgoCD traffic is plain HTTP.
+#
+#   server.autoscaling: disabled
+#     ArgoCD is a single-tenant CD tool, not a user-facing service.
+#     One replica is sufficient.
+# =============================================================================
+
+global:
+  # Matches the project name used across all Terraform resources
+  image:
+    tag: "v2.10.5"
+
+configs:
+  params:
+    # Disable TLS on ArgoCD server — handled at the ingress/bastion layer
+    server.insecure: "true"
+
+  # Repository credentials are managed via the argocd-repo-creds secret below.
+  # For a public repo, no credentials are needed.
+  # For a private GitHub repo, create the secret before running bootstrap:
+  #   kubectl create secret generic argocd-repo-creds \
+  #     --namespace argocd \
+  #     --from-literal=type=git \
+  #     --from-literal=url=https://github.com/<org>/<repo> \
+  #     --from-literal=username=git \
+  #     --from-literal=password=<GITHUB_TOKEN>
+  cm:
+    # Allow ArgoCD to manage resources in all namespaces
+    application.resourceTrackingMethod: annotation
+
+  # Resource exclusions — don't track these to avoid noise
+  resource.exclusions: |
+    - apiGroups:
+        - cilium.io
+      kinds:
+        - CiliumIdentity
+      clusters:
+        - "*"
+
+server:
+  # ClusterIP — access via port-forward only
+  service:
+    type: ClusterIP
+
+  # Disable autoscaling for ArgoCD server (single instance is fine)
+  autoscaling:
+    enabled: false
+  replicas: 1
+
+  resources:
+    requests:
+      cpu:    100m
+      memory: 128Mi
+    limits:
+      cpu:    500m
+      memory: 256Mi
+
+applicationSet:
+  resources:
+    requests:
+      cpu:    50m
+      memory: 64Mi
+    limits:
+      cpu:    200m
+      memory: 128Mi
+
+notifications:
+  # ArgoCD Notifications for Slack
+  # Sends deployment success/failure to Slack channel
+  enabled: true
+
+  resources:
+    requests:
+      cpu:    50m
+      memory: 64Mi
+    limits:
+      cpu:    200m
+      memory: 128Mi
+
+  secret:
+    # Create this secret manually or via Terraform before bootstrap:
+    #   kubectl create secret generic argocd-notifications-secret \
+    #     --namespace argocd \
+    #     --from-literal=slack-token=<SLACK_BOT_TOKEN>
+    create: false
+
+  cm:
+    create: true
+    data:
+      service.slack: |
+        token: $slack-token
+      trigger.on-deployed: |
+        - description: Application synced and healthy
+          send: [app-deployed]
+          when: app.status.operationState.phase in ['Succeeded'] and app.status.health.status == 'Healthy'
+      trigger.on-health-degraded: |
+        - description: Application health degraded
+          send: [app-health-degraded]
+          when: app.status.health.status == 'Degraded'
+      trigger.on-sync-failed: |
+        - description: Sync failed
+          send: [app-sync-failed]
+          when: app.status.operationState.phase in ['Error', 'Failed']
+      template.app-deployed: |
+        message: |
+          ✅ *ArgoCD — Deployment Successful*
+          App: {{.app.metadata.name}}
+          Version: {{.app.status.sync.revision | truncate 8 ""}}
+          Environment: Production EKS
+          Sync status: {{.app.status.sync.status}}
+          Health: {{.app.status.health.status}}
+          <{{.context.argocdUrl}}/applications/{{.app.metadata.name}}|View in ArgoCD>
+        slack:
+          attachments: |
+            [{
+              "color": "good",
+              "fields": [
+                {"title": "Application", "value": "{{.app.metadata.name}}", "short": true},
+                {"title": "Health", "value": "{{.app.status.health.status}}", "short": true}
+              ]
+            }]
+      template.app-health-degraded: |
+        message: |
+          ⚠️ *ArgoCD — Application Health Degraded*
+          App: {{.app.metadata.name}}
+          Health: {{.app.status.health.status}}
+          <{{.context.argocdUrl}}/applications/{{.app.metadata.name}}|View in ArgoCD>
+        slack:
+          attachments: |
+            [{"color": "warning"}]
+      template.app-sync-failed: |
+        message: |
+          ❌ *ArgoCD — Sync Failed*
+          App: {{.app.metadata.name}}
+          Message: {{.app.status.operationState.message}}
+          <{{.context.argocdUrl}}/applications/{{.app.metadata.name}}|View in ArgoCD>
+        slack:
+          attachments: |
+            [{"color": "danger"}]
+
+redis:
+  resources:
+    requests:
+      cpu:    50m
+      memory: 64Mi
+    limits:
+      cpu:    200m
+      memory: 128Mi
+
+repoServer:
+  resources:
+    requests:
+      cpu:    100m
+      memory: 128Mi
+    limits:
+      cpu:    500m
+      memory: 256Mi

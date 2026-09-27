@@ -1,0 +1,63 @@
+# ==============================================
+# Frontend ConfigMap
+# ==============================================
+# IMPORTANT — NEXT_PUBLIC_* VARIABLE BEHAVIOUR:
+#   Next.js bakes NEXT_PUBLIC_* variables into the JS bundle
+#   at BUILD TIME, not at runtime. This means:
+#
+#   - In docker-compose: they were baked from the .env / build args
+#     pointing to a raw IP (13.232.24.76). That works for local testing.
+#
+#   - In EKS: the image must be rebuilt with the internal ALB DNS name
+#     as the build arg. After `terraform apply`, get the internal ALB
+#     DNS from SSM Parameter Store and pass it to the Docker build:
+#
+#       INTERNAL_ALB=$(aws ssm get-parameter \
+#         --name /pip-project-ecommerce/dev/alb/internal-dns \
+#         --query Parameter.Value --output text)
+#
+#       docker build \
+#         --build-arg NEXT_PUBLIC_API_BASE_URL=http://$INTERNAL_ALB \
+#         -t <ECR_REPO>/frontend:latest .
+#
+#   - The NEXT_PUBLIC_API_BASE_URL is ONE base URL pointing to the
+#     internal ALB. The frontend prefixes each service path:
+#       /api/users    → user-service
+#       /api/products → product-service
+#       /api/cart     → cart-service
+#       /api/orders   → order-service
+#       /api/payments → payment-service
+#
+# This ConfigMap stores the RUNTIME config (NODE_ENV, log level,
+# region etc.) and the internal ALB DNS for reference.
+# The actual NEXT_PUBLIC_* value is injected at image build time.
+# ==============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: ecommerce
+  labels:
+    app: frontend
+data:
+  # Runtime config
+  NODE_ENV: "production"
+  log_level: "info"
+  aws_region: "ap-south-1"   # Update to match your deployment region
+
+  # Internal ALB DNS — populated after terraform apply.
+  # Format: internal-<hash>.<region>.elb.amazonaws.com
+  # Used as the build arg NEXT_PUBLIC_API_BASE_URL when building the image.
+  # Also stored in SSM at /pip-project-ecommerce/<env>/alb/internal-dns
+  # Replace this placeholder with the actual DNS after first terraform apply.
+  internal_alb_dns: "<INTERNAL_ALB_DNS>"
+
+  # Full base URL used by Next.js for all /api/* calls via the internal ALB
+  api_base_url: "http://<INTERNAL_ALB_DNS>"
+
+  # Individual service paths (for reference — Next.js uses api_base_url + these paths)
+  user_api_path: "/api/users"
+  product_api_path: "/api/products"
+  cart_api_path: "/api/cart"
+  order_api_path: "/api/orders"
+  payment_api_path: "/api/payments"

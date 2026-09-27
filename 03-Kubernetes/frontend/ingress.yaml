@@ -1,0 +1,89 @@
+# ==============================================
+# External ALB Ingress — internet-facing
+# Traffic path: Route53 → WAF WebACL → this ALB → frontend pods
+#
+# ANNOTATIONS GUIDE:
+#  - scheme: internet-facing  → ALB in PUBLIC subnets, reachable from internet
+#  - wafv2-acl-arn            → attaches WAF WebACL (blocks OWASP top 10 + rate limit)
+#  - certificate-arn          → ACM cert for HTTPS termination at the ALB
+#  - ssl-redirect             → forces HTTP→HTTPS (port 80 redirects to 443)
+#  - listen-ports             → ALB listens on both 80 (redirect) and 443 (HTTPS)
+#  - target-type: ip          → routes directly to pod IPs (not node ports),
+#                               works because AWS VPC CNI assigns real VPC IPs to pods
+#  - access-log bucket        → ALB access logs → S3 (set via Terraform output)
+#  - group.name               → allows multiple Ingresses to share one ALB
+#                               (external-alb-group = this internet-facing ALB)
+# ==============================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend-external-ingress
+  namespace: ecommerce
+  labels:
+    app: frontend
+    tier: presentation
+  annotations:
+    # ALB Controller
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # WAF — value is the WAF WebACL ARN from Terraform output module.waf.web_acl_arn
+    # Replace <WAF_WEBACL_ARN> with the actual ARN after terraform apply
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_WEBACL_ARN>"
+
+    # TLS — ACM certificate for your domain
+    # Replace <ACM_CERT_ARN> with the ACM cert ARN for your domain
+    alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN>"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # ALB access logs → S3 (bucket = Terraform output module.waf.logs_bucket_name)
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=<LOGS_BUCKET_NAME>,
+      access_logs.s3.prefix=alb-logs,
+      idle_timeout.timeout_seconds=60,
+      routing.http2.enabled=true,
+      deletion_protection.enabled=true
+
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Group — multiple Ingress objects share this single external ALB
+    alb.ingress.kubernetes.io/group.name: external-alb-group
+    alb.ingress.kubernetes.io/group.order: "10"
+
+    # Subnets — public subnets (comma-separated subnet IDs from Terraform)
+    # Replace with actual IDs from terraform output module.networking.public_subnet_ids
+    alb.ingress.kubernetes.io/subnets: "<PUBLIC_SUBNET_ID_1>,<PUBLIC_SUBNET_ID_2>,<PUBLIC_SUBNET_ID_3>"
+
+    # Tags applied to the ALB resource in AWS
+    alb.ingress.kubernetes.io/tags: "Environment=prod,Project=pip-project-ecommerce,ManagedBy=terraform"
+spec:
+  ingressClassName: alb
+  rules:
+  # Replace yourdomain.com with your actual domain
+  - host: yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
+  - host: www.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80

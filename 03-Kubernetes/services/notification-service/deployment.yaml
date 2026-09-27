@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service-deployment
+  namespace: ecommerce
+  labels:
+    app: notification-service
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notification-service
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        tier: backend
+    spec:
+      serviceAccountName: ecommerce-services-sa
+
+      volumes:
+      - name: aws-secrets
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "notification-service-secrets"
+
+      containers:
+      - name: notification-service
+        image: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/pip-project-ecommerce/notification-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4006   # FIXED: was 3006
+          name: http
+
+        volumeMounts:
+        - name: aws-secrets
+          mountPath: "/mnt/secrets"
+          readOnly: true
+
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "4006"
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: aws_region
+
+        # notification-service has no DB — it only calls SNS + SES
+        - name: SNS_TOPIC_ARN
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: sns_topic_arn
+
+        - name: SES_FROM_EMAIL
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: ses_from_email
+
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4006
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 4006
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [notification-service]
+              topologyKey: kubernetes.io/hostname

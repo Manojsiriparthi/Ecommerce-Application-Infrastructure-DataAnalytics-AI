@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: ecommerce
+  labels:
+    app: frontend
+spec:
+  # ClusterIP — traffic enters via the external ALB Ingress, NOT directly.
+  # type: LoadBalancer would create a bare NLB, bypassing WAF entirely.
+  type: ClusterIP
+  selector:
+    app: frontend
+    tier: presentation
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP

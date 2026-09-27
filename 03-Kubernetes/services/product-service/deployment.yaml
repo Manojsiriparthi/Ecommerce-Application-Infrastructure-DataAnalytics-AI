@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service-deployment
+  namespace: ecommerce
+  labels:
+    app: product-service
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: product-service
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: product-service
+        tier: backend
+    spec:
+      serviceAccountName: ecommerce-services-sa
+
+      volumes:
+      - name: aws-secrets
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "product-service-secrets"
+
+      containers:
+      - name: product-service
+        image: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/pip-project-ecommerce/product-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4002   # FIXED: was 3002
+          name: http
+
+        volumeMounts:
+        - name: aws-secrets
+          mountPath: "/mnt/secrets"
+          readOnly: true
+
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "4002"
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: aws_region
+
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: product-db-url
+              key: database_url
+
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: jwt_secret
+
+        - name: SNS_TOPIC_ARN
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: sns_topic_arn
+
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4002
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 4002
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [product-service]
+              topologyKey: kubernetes.io/hostname

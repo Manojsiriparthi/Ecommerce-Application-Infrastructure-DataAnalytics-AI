@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: ecommerce
+  labels:
+    app: frontend
+    tier: presentation
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend
+      tier: presentation
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: presentation
+    spec:
+      # Frontend pods use the same IRSA ServiceAccount so they can call
+      # SSM Parameter Store to read the internal ALB DNS at startup if needed.
+      serviceAccountName: ecommerce-services-sa
+
+      containers:
+      - name: frontend
+        # Image built with NEXT_PUBLIC_API_BASE_URL=http://<INTERNAL_ALB_DNS>
+        # Rebuild the image after terraform apply with the actual internal ALB DNS:
+        #   docker build \
+        #     --build-arg NEXT_PUBLIC_API_BASE_URL=http://<INTERNAL_ALB_DNS> \
+        #     --build-arg NEXT_PUBLIC_USER_API=http://<INTERNAL_ALB_DNS>/api/users \
+        #     --build-arg NEXT_PUBLIC_PRODUCT_API=http://<INTERNAL_ALB_DNS>/api/products \
+        #     --build-arg NEXT_PUBLIC_CART_API=http://<INTERNAL_ALB_DNS>/api/cart \
+        #     --build-arg NEXT_PUBLIC_ORDER_API=http://<INTERNAL_ALB_DNS>/api/orders \
+        #     --build-arg NEXT_PUBLIC_PAYMENT_API=http://<INTERNAL_ALB_DNS>/api/payments \
+        #     -t <ECR_REPO>/frontend:latest .
+        image: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/pip-project-ecommerce/frontend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+
+        env:
+        - name: NODE_ENV
+          value: "production"
+
+        # Runtime env vars — not baked into the bundle, used by Next.js server
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: aws_region
+
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [frontend]
+              topologyKey: kubernetes.io/hostname

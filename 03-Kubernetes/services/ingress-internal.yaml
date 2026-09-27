@@ -1,0 +1,135 @@
+# ==============================================
+# Internal ALB Ingress — private, path-based routing
+# Traffic path: frontend pods → this ALB → backend service pods
+#
+# WHY A SEPARATE INTERNAL ALB:
+#  - Backend services must NEVER be reachable from the internet.
+#  - internal scheme places the ALB in PRIVATE subnets — no public IP.
+#  - No WAF needed here (all traffic is intra-VPC from frontend pods).
+#  - Path-based routing means ONE ALB serves all 6 services — no NLB
+#    per service, no NodePort exposure, no service mesh needed.
+#  - Frontend reads the ALB DNS name from SSM Parameter Store at startup.
+#
+# HOW FRONTEND CALLS SERVICES:
+#  - All NEXT_PUBLIC_*_API env vars point to this internal ALB DNS.
+#  - e.g. NEXT_PUBLIC_USER_API=http://<internal-alb-dns>/api/users
+#  - The ALB routes /api/users/* → user-service:4001
+#  - The ALB routes /api/products/* → product-service:4002  etc.
+#
+# ANNOTATIONS GUIDE:
+#  - scheme: internal         → ALB in PRIVATE subnets, VPC-only
+#  - target-type: ip          → routes to pod IPs directly (no node port)
+#  - group.name               → internal-alb-group (different ALB from external)
+#  - listen-ports: HTTP 80    → internal traffic is plain HTTP (TLS terminates
+#                               at the external ALB; internal is trusted VPC)
+# ==============================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: services-internal-ingress
+  namespace: ecommerce
+  labels:
+    tier: backend
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # Health check defaults (each service has /health endpoint)
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Group — all backend services share this single internal ALB
+    alb.ingress.kubernetes.io/group.name: internal-alb-group
+    alb.ingress.kubernetes.io/group.order: "10"
+
+    # Subnets — PRIVATE subnets only (comma-separated subnet IDs)
+    # Replace with actual IDs from terraform output module.networking.private_subnet_ids
+    alb.ingress.kubernetes.io/subnets: "<PRIVATE_SUBNET_ID_1>,<PRIVATE_SUBNET_ID_2>,<PRIVATE_SUBNET_ID_3>"
+
+    # ALB access logs → same S3 bucket, different prefix
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=<LOGS_BUCKET_NAME>,
+      access_logs.s3.prefix=alb-logs-internal,
+      idle_timeout.timeout_seconds=60,
+      routing.http2.enabled=true
+
+    alb.ingress.kubernetes.io/tags: "Environment=prod,Project=pip-project-ecommerce,ManagedBy=terraform,Tier=internal"
+spec:
+  ingressClassName: alb
+  rules:
+  # No host — internal ALB is accessed by DNS name, not a domain
+  # All routing is path-based
+  - http:
+      paths:
+      # ==============================================
+      # User Service — auth, registration, profile
+      # ==============================================
+      - path: /api/users
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 4001
+
+      # ==============================================
+      # Product Service — catalog, search, inventory
+      # ==============================================
+      - path: /api/products
+        pathType: Prefix
+        backend:
+          service:
+            name: product-service
+            port:
+              number: 4002
+
+      # ==============================================
+      # Cart Service — add/remove/view cart
+      # ==============================================
+      - path: /api/cart
+        pathType: Prefix
+        backend:
+          service:
+            name: cart-service
+            port:
+              number: 4003
+
+      # ==============================================
+      # Order Service — place orders, order history
+      # ==============================================
+      - path: /api/orders
+        pathType: Prefix
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 4004
+
+      # ==============================================
+      # Payment Service — process payments
+      # ==============================================
+      - path: /api/payments
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-service
+            port:
+              number: 4005
+
+      # ==============================================
+      # Notification Service — health check only
+      # (notification-service is called internally by
+      #  order-service via ClusterIP DNS, not by frontend)
+      # ==============================================
+      - path: /internal/notifications
+        pathType: Prefix
+        backend:
+          service:
+            name: notification-service
+            port:
+              number: 4006
