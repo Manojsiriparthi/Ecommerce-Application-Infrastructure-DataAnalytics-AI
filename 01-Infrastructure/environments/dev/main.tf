@@ -211,11 +211,10 @@ module "waf" {
 # ==============================================
 module "route53_acm" {
   source = "../../modules/route53-acm"
-  count  = var.domain_name != "" ? 1 : 0   # skip entirely when no domain registered
 
   project_name = "pip-project-ecommerce"
   environment  = var.environment
-  domain_name  = var.domain_name
+  domain_name  = var.domain_name   # empty string = all resources skipped inside module
   alb_dns_name = var.alb_dns_name
   alb_zone_id  = var.alb_dns_name != "" ? "Z11127IXD6XFTK" : ""
 
