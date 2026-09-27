@@ -33,7 +33,7 @@
 # Security Group for ElastiCache
 resource "aws_security_group" "elasticache" {
   name        = "${var.project_name}-elasticache-sg"
-  description = "ElastiCache Redis — allow port 6379 from EKS nodes only"
+  description = "ElastiCache Redis - allow port 6379 from EKS nodes only"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -104,7 +104,7 @@ resource "aws_elasticache_parameter_group" "ecommerce" {
 # ==============================================
 resource "aws_elasticache_replication_group" "ecommerce" {
   replication_group_id = "${var.project_name}-redis"
-  description          = "Redis cache for ${var.project_name} — sessions, cart, rate-limits"
+  description          = "Redis cache for ${var.project_name} - sessions, cart, rate-limits"
 
   node_type            = var.node_type
   num_cache_clusters   = var.num_replicas + 1  # 1 primary + replicas

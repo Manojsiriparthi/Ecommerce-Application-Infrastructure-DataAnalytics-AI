@@ -1,9 +1,9 @@
 # =============================================================================
-# Monitoring Module — CloudWatch Alarms + EBS DLM Snapshots
+# Monitoring Module - CloudWatch Alarms + EBS DLM Snapshots
 # =============================================================================
 # Rubric requirements covered here:
 #   ✅ 20+ CloudWatch alarms for infrastructure health
-#   ✅ CloudWatch Logs — centralised log groups
+#   ✅ CloudWatch Logs - centralised log groups
 #   ✅ Automated EBS snapshots to S3 (via DLM lifecycle policy)
 #
 # ALARM COUNT IN THIS MODULE: 22 alarms
@@ -20,7 +20,7 @@ locals {
 }
 
 # =============================================================================
-# ALB Alarms — 5 alarms
+# ALB Alarms - 5 alarms
 # Rubric: ALB health checks 100% healthy
 # =============================================================================
 
@@ -33,7 +33,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx_external" {
   period              = 60
   statistic           = "Sum"
   threshold           = 10
-  alarm_description   = "External ALB: more than 10 backend 5xx errors per minute — application error"
+  alarm_description   = "External ALB: more than 10 backend 5xx errors per minute - application error"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -72,8 +72,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_target_response_time" {
   namespace           = "AWS/ApplicationELB"
   period              = 60
   extended_statistic  = "p99"
-  threshold           = 0.2   # 200ms — rubric SLO target
-  alarm_description   = "ALB p99 response time > 200ms — SLO breach"
+  threshold           = 0.2   # 200ms - rubric SLO target
+  alarm_description   = "ALB p99 response time > 200ms - SLO breach"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -93,7 +93,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   period              = 60
   statistic           = "Maximum"
   threshold           = 1
-  alarm_description   = "ALB has unhealthy targets — pods may be crashing"
+  alarm_description   = "ALB has unhealthy targets - pods may be crashing"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -113,7 +113,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_request_count_spike" {
   period              = 60
   statistic           = "Sum"
   threshold           = 100000  # 100K requests/min = potential DDoS
-  alarm_description   = "ALB request count spike — possible DDoS or traffic burst"
+  alarm_description   = "ALB request count spike - possible DDoS or traffic burst"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -125,7 +125,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_request_count_spike" {
 }
 
 # =============================================================================
-# EKS Node Alarms — 4 alarms
+# EKS Node Alarms - 4 alarms
 # Rubric: Auto Scaling tested, scale-out at CPU > 70%
 # =============================================================================
 
@@ -138,7 +138,7 @@ resource "aws_cloudwatch_metric_alarm" "eks_node_cpu" {
   period              = 60
   statistic           = "Average"
   threshold           = 80
-  alarm_description   = "EKS node CPU > 80% — Cluster Autoscaler should add a node"
+  alarm_description   = "EKS node CPU > 80% - Cluster Autoscaler should add a node"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -178,7 +178,7 @@ resource "aws_cloudwatch_metric_alarm" "eks_pod_restarts" {
   period              = 300
   statistic           = "Sum"
   threshold           = 5
-  alarm_description   = "EKS pods restarting frequently — crash loop or OOM kill"
+  alarm_description   = "EKS pods restarting frequently - crash loop or OOM kill"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -199,7 +199,7 @@ resource "aws_cloudwatch_metric_alarm" "eks_pending_pods" {
   period              = 120
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "Pods pending in ecommerce namespace — nodes may be full"
+  alarm_description   = "Pods pending in ecommerce namespace - nodes may be full"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -213,7 +213,7 @@ resource "aws_cloudwatch_metric_alarm" "eks_pending_pods" {
 }
 
 # =============================================================================
-# Security Alarms — 3 alarms
+# Security Alarms - 3 alarms
 # =============================================================================
 
 resource "aws_cloudwatch_metric_alarm" "waf_blocked_requests" {
@@ -225,7 +225,7 @@ resource "aws_cloudwatch_metric_alarm" "waf_blocked_requests" {
   period              = 300
   statistic           = "Sum"
   threshold           = 1000
-  alarm_description   = "WAF blocked > 1000 requests in 5 minutes — possible attack"
+  alarm_description   = "WAF blocked > 1000 requests in 5 minutes - possible attack"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -247,7 +247,7 @@ resource "aws_cloudwatch_metric_alarm" "secrets_manager_errors" {
   period              = 300
   statistic           = "Sum"
   threshold           = 10
-  alarm_description   = "Multiple Secrets Manager access failures — pods may not be getting credentials"
+  alarm_description   = "Multiple Secrets Manager access failures - pods may not be getting credentials"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -263,7 +263,7 @@ resource "aws_cloudwatch_metric_alarm" "nat_gateway_errors" {
   period              = 60
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "NAT Gateway port allocation errors — outbound traffic failing from private subnets"
+  alarm_description   = "NAT Gateway port allocation errors - outbound traffic failing from private subnets"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 
@@ -275,7 +275,7 @@ resource "aws_cloudwatch_metric_alarm" "nat_gateway_errors" {
 }
 
 # =============================================================================
-# CloudWatch Dashboard — Monitoring overview
+# CloudWatch Dashboard - Monitoring overview
 # Rubric: Monitoring dashboards live
 # =============================================================================
 
@@ -374,7 +374,7 @@ data "aws_caller_identity" "current" {}
 
 # =============================================================================
 # EBS Snapshot Lifecycle Policy (DLM)
-# Rubric: EBS snapshots to S3 — automated daily backups
+# Rubric: EBS snapshots to S3 - automated daily backups
 # =============================================================================
 # DLM (Data Lifecycle Manager) creates daily EBS snapshots automatically.
 # All snapshots are stored in S3 by AWS internally.
@@ -405,7 +405,7 @@ resource "aws_iam_role_policy_attachment" "dlm" {
 }
 
 resource "aws_dlm_lifecycle_policy" "ebs_snapshots" {
-  description        = "${var.project_name} — daily EBS snapshots, 7-day retention"
+  description        = "${var.project_name} - daily EBS snapshots, 7-day retention"
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
 
@@ -419,7 +419,7 @@ resource "aws_dlm_lifecycle_policy" "ebs_snapshots" {
     }
 
     schedule {
-      name = "Daily EBS snapshot — 7 day retention"
+      name = "Daily EBS snapshot - 7 day retention"
 
       create_rule {
         interval      = 24
