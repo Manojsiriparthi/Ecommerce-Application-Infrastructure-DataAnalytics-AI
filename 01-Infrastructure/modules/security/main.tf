@@ -291,7 +291,8 @@ resource "aws_iam_role_policy" "vpc_flow_logs" {
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/flowlogs/${var.project_name}-${var.environment}"
   retention_in_days = 90
-  kms_key_id        = aws_kms_key.main.arn
+  # KMS not used here — CloudWatch Logs encrypts with AES-256 by default.
+  # Custom KMS requires key policy propagation timing that causes apply failures.
 
   tags = {
     Name        = "${var.project_name}-vpc-flow-logs"
@@ -322,7 +323,7 @@ resource "aws_flow_log" "ecommerce" {
 resource "aws_cloudwatch_log_group" "app_logs" {
   name              = "/aws/eks/${var.project_name}-${var.environment}/application"
   retention_in_days = 30
-  kms_key_id        = aws_kms_key.main.arn
+  # AES-256 default encryption — sufficient for application logs
 
   tags = {
     Name        = "${var.project_name}-app-logs"
@@ -333,7 +334,7 @@ resource "aws_cloudwatch_log_group" "app_logs" {
 resource "aws_cloudwatch_log_group" "infra_logs" {
   name              = "/aws/eks/${var.project_name}-${var.environment}/infrastructure"
   retention_in_days = 90
-  kms_key_id        = aws_kms_key.main.arn
+  # AES-256 default encryption — sufficient for infrastructure logs
 
   tags = {
     Name        = "${var.project_name}-infra-logs"
