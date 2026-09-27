@@ -58,6 +58,13 @@ metadata:
       idle_timeout.timeout_seconds=60,
       routing.http2.enabled=true
 
+    # Target group stickiness + deregistration delay
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      stickiness.enabled=true,
+      stickiness.lb_cookie.duration_seconds=3600,
+      stickiness.type=lb_cookie,
+      deregistration_delay.timeout_seconds=30
+
     alb.ingress.kubernetes.io/tags: "Environment=prod,Project=pip-project-ecommerce,ManagedBy=terraform,Tier=internal"
 spec:
   ingressClassName: alb

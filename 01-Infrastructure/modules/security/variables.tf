@@ -32,3 +32,9 @@ variable "ses_from_email" {
   type        = string
   default     = "noreply@yourdomain.com"
 }
+
+variable "vpc_id" {
+  description = "VPC ID for Flow Logs attachment. Pass module.networking.vpc_id."
+  type        = string
+  default     = ""
+}

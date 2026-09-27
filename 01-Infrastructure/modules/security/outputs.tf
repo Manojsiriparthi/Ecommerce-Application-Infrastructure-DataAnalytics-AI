@@ -22,3 +22,18 @@ output "ses_from_email_ssm_path" {
   description = "SSM Parameter path for SES sender email"
   value       = aws_ssm_parameter.ses_from_email.name
 }
+
+output "guardduty_detector_id" {
+  description = "GuardDuty detector ID"
+  value       = aws_guardduty_detector.ecommerce.id
+}
+
+output "vpc_flow_log_group" {
+  description = "CloudWatch Log Group for VPC Flow Logs"
+  value       = aws_cloudwatch_log_group.vpc_flow_logs.name
+}
+
+output "app_log_group" {
+  description = "CloudWatch Log Group for application logs (Fluent Bit target)"
+  value       = aws_cloudwatch_log_group.app_logs.name
+}

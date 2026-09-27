@@ -22,6 +22,7 @@ resource "aws_instance" "bastion" {
   tags = {
     Name        = "${var.project_name}-bastion"
     Environment = var.environment
+    Backup      = "true"   # DLM lifecycle policy targets volumes with this tag
   }
 }
 
@@ -76,6 +77,7 @@ resource "aws_instance" "jenkins" {
   tags = {
     Name        = "${var.project_name}-jenkins"
     Environment = var.environment
+    Backup      = "true"   # DLM lifecycle policy targets volumes with this tag
   }
 }
 

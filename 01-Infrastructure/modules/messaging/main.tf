@@ -19,6 +19,12 @@ resource "aws_sqs_queue" "jenkins_failures_dlq" {
   message_retention_seconds = 1209600 # 14 days
   kms_master_key_id         = var.kms_key_arn != "" ? var.kms_key_arn : null
 
+  timeouts {
+    create = "10m"
+    update = "10m"
+    delete = "10m"
+  }
+
   tags = {
     Name        = "${var.project_name}-jenkins-failures-dlq"
     Environment = var.environment
@@ -35,6 +41,13 @@ resource "aws_sqs_queue" "jenkins_failures" {
     deadLetterTargetArn = aws_sqs_queue.jenkins_failures_dlq.arn
     maxReceiveCount     = 3
   })
+
+  # Increased timeouts to handle transient AWS API slowness
+  timeouts {
+    create = "10m"
+    update = "10m"
+    delete = "10m"
+  }
 
   tags = {
     Name        = "${var.project_name}-jenkins-failures"

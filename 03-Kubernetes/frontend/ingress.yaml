@@ -47,6 +47,16 @@ metadata:
       routing.http2.enabled=true,
       deletion_protection.enabled=true
 
+    # Target group stickiness — rubric requirement
+    # Keeps the same user on the same pod for session consistency
+    # Duration: 1 day (86400 seconds)
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      stickiness.enabled=true,
+      stickiness.lb_cookie.duration_seconds=86400,
+      stickiness.type=lb_cookie,
+      deregistration_delay.timeout_seconds=30,
+      slow_start.duration_seconds=30
+
     # Health check
     alb.ingress.kubernetes.io/healthcheck-path: /
     alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"

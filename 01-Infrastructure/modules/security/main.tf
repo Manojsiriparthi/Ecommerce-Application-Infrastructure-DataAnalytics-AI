@@ -107,3 +107,159 @@ resource "aws_ssm_parameter" "ses_from_email" {
     Environment = var.environment
   }
 }
+
+# ==============================================
+# GuardDuty — threat detection
+# Rubric requirement: GuardDuty enabled, HIGH severity < 5
+# Detects: compromised EC2/EKS nodes, unusual API calls,
+#          crypto-mining, data exfiltration attempts
+# ==============================================
+resource "aws_guardduty_detector" "ecommerce" {
+  enable = true
+
+  datasources {
+    s3_logs {
+      enable = true   # Detect malicious S3 access patterns
+    }
+    kubernetes {
+      audit_logs {
+        enable = true  # Detect unusual K8s API calls in EKS
+      }
+    }
+    malware_protection {
+      scan_ec2_instance_with_findings {
+        ebs_volumes {
+          enable = true  # Scan EBS volumes on threat detection
+        }
+      }
+    }
+  }
+
+  tags = {
+    Name        = "${var.project_name}-guardduty"
+    Environment = var.environment
+  }
+}
+
+# CloudWatch alarm — HIGH severity GuardDuty findings
+# Rubric: HIGH severity findings < 5
+resource "aws_cloudwatch_metric_alarm" "guardduty_high" {
+  alarm_name          = "${var.project_name}-guardduty-high-findings"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FindingCount"
+  namespace           = "AWS/GuardDuty"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "GuardDuty HIGH/CRITICAL finding detected — investigate immediately"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    DetectorId = aws_guardduty_detector.ecommerce.id
+    Severity   = "High"
+  }
+
+  tags = {
+    Name        = "${var.project_name}-guardduty-alarm"
+    Environment = var.environment
+  }
+}
+
+# ==============================================
+# VPC Flow Logs → CloudWatch Logs
+# Rubric requirement: VPC flow logs enabled
+# Records all IP traffic to/from ENIs in the VPC.
+# Used for: security analysis, network troubleshooting,
+#           compliance auditing
+# ==============================================
+resource "aws_iam_role" "vpc_flow_logs" {
+  name = "${var.project_name}-vpc-flow-logs-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "vpc-flow-logs.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-vpc-flow-logs-role"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_role_policy" "vpc_flow_logs" {
+  name = "${var.project_name}-vpc-flow-logs-policy"
+  role = aws_iam_role.vpc_flow_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
+  name              = "/aws/vpc/flowlogs/${var.project_name}-${var.environment}"
+  retention_in_days = 90
+  kms_key_id        = aws_kms_key.main.arn
+
+  tags = {
+    Name        = "${var.project_name}-vpc-flow-logs"
+    Environment = var.environment
+  }
+}
+
+# Flow log resource — vpc_id passed in as variable
+resource "aws_flow_log" "ecommerce" {
+  count           = var.vpc_id != "" ? 1 : 0
+
+  iam_role_arn    = aws_iam_role.vpc_flow_logs.arn
+  log_destination = aws_cloudwatch_log_group.vpc_flow_logs.arn
+  traffic_type    = "ALL"
+  vpc_id          = var.vpc_id
+
+  tags = {
+    Name        = "${var.project_name}-vpc-flow-log"
+    Environment = var.environment
+  }
+}
+
+# ==============================================
+# CloudWatch Log Groups (centralised application logs)
+# Fluent Bit (in EKS) ships pod logs to these groups.
+# Rubric: centralize application and infrastructure logs
+# ==============================================
+resource "aws_cloudwatch_log_group" "app_logs" {
+  name              = "/aws/eks/${var.project_name}-${var.environment}/application"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.main.arn
+
+  tags = {
+    Name        = "${var.project_name}-app-logs"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_log_group" "infra_logs" {
+  name              = "/aws/eks/${var.project_name}-${var.environment}/infrastructure"
+  retention_in_days = 90
+  kms_key_id        = aws_kms_key.main.arn
+
+  tags = {
+    Name        = "${var.project_name}-infra-logs"
+    Environment = var.environment
+  }
+}

@@ -41,6 +41,7 @@ module "security" {
   jwt_secret           = var.jwt_secret
   internal_service_key = var.internal_service_key
   ses_from_email       = var.ses_from_email
+  vpc_id               = module.networking.vpc_id   # enables VPC Flow Logs
 
   depends_on = [module.networking]
 }
@@ -231,6 +232,27 @@ resource "null_resource" "networking_dependency" {
     module.aurora,
     module.elasticache,
     module.waf,
-    module.compute
+    module.compute,
+    module.monitoring
   ]
+}
+
+# ==============================================
+# Monitoring — CloudWatch alarms (20+), dashboard, EBS DLM snapshots
+# Rubric: 20+ alarms, monitoring dashboards live, EBS snapshots to S3
+# ==============================================
+module "monitoring" {
+  source = "../../modules/monitoring"
+
+  project_name            = "pip-project-ecommerce"
+  environment             = var.environment
+  region                  = var.primary_region
+  sns_topic_arn           = module.messaging.sns_topic_arn
+  nat_gateway_id          = module.networking.nat_gateway_id
+  # external_alb_arn_suffix filled after first apply + Ingress creation
+  # Get with: kubectl get ingress frontend-external-ingress -n ecommerce \
+  #   -o jsonpath='{.metadata.annotations.alb\.ingress\.kubernetes\.io/load-balancer-arn}'
+  external_alb_arn_suffix = ""
+
+  depends_on = [module.messaging, module.networking, module.eks_addons]
 }

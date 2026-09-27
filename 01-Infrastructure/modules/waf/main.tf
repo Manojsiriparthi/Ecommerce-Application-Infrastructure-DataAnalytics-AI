@@ -47,6 +47,14 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
 resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   bucket = aws_s3_bucket.logs.id
 
+  # Must wait for public access block and versioning to be applied first.
+  # Without this, the lifecycle API call races the bucket creation and times out.
+  depends_on = [
+    aws_s3_bucket_public_access_block.logs,
+    aws_s3_bucket_versioning.logs,
+    aws_s3_bucket_server_side_encryption_configuration.logs,
+  ]
+
   rule {
     id     = "waf-alb-logs-lifecycle"
     status = "Enabled"
@@ -129,7 +137,7 @@ resource "aws_s3_bucket_policy" "logs" {
 # ==============================================
 resource "aws_wafv2_web_acl" "ecommerce" {
   name        = "${var.project_name}-waf-${var.environment}"
-  description = "WAF for ${var.project_name} external ALB — blocks OWASP top 10"
+  description = "WAF for ${var.project_name} external ALB. Blocks OWASP top 10."
   scope       = "REGIONAL"
 
   default_action {
