@@ -16,15 +16,18 @@
 # =============================================================================
 
 locals {
-  alarm_actions = var.sns_topic_arn != "" ? [var.sns_topic_arn] : []
+  alarm_actions  = var.sns_topic_arn != "" ? [var.sns_topic_arn] : []
+  # ALB alarms are only created after the ALB exists (after first Ingress apply)
+  alb_enabled    = trimspace(var.external_alb_arn_suffix) != ""
 }
 
 # =============================================================================
-# ALB Alarms - 5 alarms
-# Rubric: ALB health checks 100% healthy
+# ALB Alarms - created only when external_alb_arn_suffix is set
+# Set external_alb_arn_suffix in dev/main.tf after first apply + Ingress creation
 # =============================================================================
 
 resource "aws_cloudwatch_metric_alarm" "alb_5xx_external" {
+  count               = local.alb_enabled ? 1 : 0
   alarm_name          = "${var.project_name}-alb-external-5xx-high"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -33,18 +36,15 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx_external" {
   period              = 60
   statistic           = "Sum"
   threshold           = 10
-  alarm_description   = "External ALB: more than 10 backend 5xx errors per minute - application error"
+  alarm_description   = "External ALB more than 10 backend 5xx errors per minute - application error"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
-
-  dimensions = {
-    LoadBalancer = var.external_alb_arn_suffix
-  }
-
-  tags = { Name = "${var.project_name}-alb-5xx-alarm", Environment = var.environment }
+  dimensions          = { LoadBalancer = var.external_alb_arn_suffix }
+  tags                = { Name = "${var.project_name}-alb-5xx-alarm", Environment = var.environment }
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_4xx_external" {
+  count               = local.alb_enabled ? 1 : 0
   alarm_name          = "${var.project_name}-alb-external-4xx-high"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -53,18 +53,15 @@ resource "aws_cloudwatch_metric_alarm" "alb_4xx_external" {
   period              = 60
   statistic           = "Sum"
   threshold           = 100
-  alarm_description   = "External ALB: more than 100 client 4xx errors per minute"
+  alarm_description   = "External ALB more than 100 client 4xx errors per minute"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
-
-  dimensions = {
-    LoadBalancer = var.external_alb_arn_suffix
-  }
-
-  tags = { Name = "${var.project_name}-alb-4xx-alarm", Environment = var.environment }
+  dimensions          = { LoadBalancer = var.external_alb_arn_suffix }
+  tags                = { Name = "${var.project_name}-alb-4xx-alarm", Environment = var.environment }
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_target_response_time" {
+  count               = local.alb_enabled ? 1 : 0
   alarm_name          = "${var.project_name}-alb-response-time-high"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
@@ -72,19 +69,16 @@ resource "aws_cloudwatch_metric_alarm" "alb_target_response_time" {
   namespace           = "AWS/ApplicationELB"
   period              = 60
   extended_statistic  = "p99"
-  threshold           = 0.2   # 200ms - rubric SLO target
-  alarm_description   = "ALB p99 response time > 200ms - SLO breach"
+  threshold           = 0.2
+  alarm_description   = "ALB p99 response time above 200ms - SLO breach"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
-
-  dimensions = {
-    LoadBalancer = var.external_alb_arn_suffix
-  }
-
-  tags = { Name = "${var.project_name}-alb-latency-alarm", Environment = var.environment }
+  dimensions          = { LoadBalancer = var.external_alb_arn_suffix }
+  tags                = { Name = "${var.project_name}-alb-latency-alarm", Environment = var.environment }
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
+  count               = local.alb_enabled ? 1 : 0
   alarm_name          = "${var.project_name}-alb-unhealthy-hosts"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
@@ -96,15 +90,12 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   alarm_description   = "ALB has unhealthy targets - pods may be crashing"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
-
-  dimensions = {
-    LoadBalancer = var.external_alb_arn_suffix
-  }
-
-  tags = { Name = "${var.project_name}-alb-unhealthy-alarm", Environment = var.environment }
+  dimensions          = { LoadBalancer = var.external_alb_arn_suffix }
+  tags                = { Name = "${var.project_name}-alb-unhealthy-alarm", Environment = var.environment }
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_request_count_spike" {
+  count               = local.alb_enabled ? 1 : 0
   alarm_name          = "${var.project_name}-alb-request-spike"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -112,16 +103,12 @@ resource "aws_cloudwatch_metric_alarm" "alb_request_count_spike" {
   namespace           = "AWS/ApplicationELB"
   period              = 60
   statistic           = "Sum"
-  threshold           = 100000  # 100K requests/min = potential DDoS
+  threshold           = 100000
   alarm_description   = "ALB request count spike - possible DDoS or traffic burst"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
-
-  dimensions = {
-    LoadBalancer = var.external_alb_arn_suffix
-  }
-
-  tags = { Name = "${var.project_name}-alb-spike-alarm", Environment = var.environment }
+  dimensions          = { LoadBalancer = var.external_alb_arn_suffix }
+  tags                = { Name = "${var.project_name}-alb-spike-alarm", Environment = var.environment }
 }
 
 # =============================================================================
@@ -277,6 +264,7 @@ resource "aws_cloudwatch_metric_alarm" "nat_gateway_errors" {
 # =============================================================================
 # CloudWatch Dashboard - Monitoring overview
 # Rubric: Monitoring dashboards live
+# Only includes metrics that exist at first apply (no ALB - created later)
 # =============================================================================
 
 resource "aws_cloudwatch_dashboard" "ecommerce" {
@@ -289,14 +277,14 @@ resource "aws_cloudwatch_dashboard" "ecommerce" {
         width  = 12
         height = 6
         properties = {
-          title  = "ALB Request Count + 5xx Errors"
-          view   = "timeSeries"
-          region = var.region
+          title   = "Aurora CPU Utilization"
+          view    = "timeSeries"
+          region  = var.region
+          period  = 60
+          stat    = "Average"
           metrics = [
-            ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", var.external_alb_arn_suffix],
-            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", var.external_alb_arn_suffix]
+            ["AWS/RDS", "CPUUtilization", "DBClusterIdentifier", "${var.project_name}-cluster"]
           ]
-          period = 60
         }
       },
       {
@@ -304,31 +292,14 @@ resource "aws_cloudwatch_dashboard" "ecommerce" {
         width  = 12
         height = 6
         properties = {
-          title  = "ALB p99 Response Time (SLO: < 200ms)"
-          view   = "timeSeries"
-          region = var.region
+          title   = "Aurora Database Connections"
+          view    = "timeSeries"
+          region  = var.region
+          period  = 60
+          stat    = "Average"
           metrics = [
-            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", var.external_alb_arn_suffix, { "stat" = "p99" }]
-          ]
-          period = 60
-          annotations = {
-            horizontal = [{ value = 0.2, color = "#ff0000", label = "SLO threshold 200ms" }]
-          }
-        }
-      },
-      {
-        type   = "metric"
-        width  = 12
-        height = 6
-        properties = {
-          title  = "Aurora CPU + Connections"
-          view   = "timeSeries"
-          region = var.region
-          metrics = [
-            ["AWS/RDS", "CPUUtilization", "DBClusterIdentifier", "${var.project_name}-cluster"],
             ["AWS/RDS", "DatabaseConnections", "DBClusterIdentifier", "${var.project_name}-cluster"]
           ]
-          period = 60
         }
       },
       {
@@ -336,33 +307,28 @@ resource "aws_cloudwatch_dashboard" "ecommerce" {
         width  = 12
         height = 6
         properties = {
-          title  = "ElastiCache Redis CPU + Memory"
-          view   = "timeSeries"
-          region = var.region
+          title   = "ElastiCache Redis CPU"
+          view    = "timeSeries"
+          region  = var.region
+          period  = 60
+          stat    = "Average"
           metrics = [
-            ["AWS/ElastiCache", "CPUUtilization", "ReplicationGroupId", "${var.project_name}-redis"],
-            ["AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "ReplicationGroupId", "${var.project_name}-redis"]
+            ["AWS/ElastiCache", "CPUUtilization", "ReplicationGroupId", "${var.project_name}-redis"]
           ]
-          period = 60
         }
       },
       {
-        type   = "alarm"
-        width  = 24
-        height = 8
+        type   = "metric"
+        width  = 12
+        height = 6
         properties = {
-          title = "All Alarm Status"
-          alarms = [
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-alb-external-5xx-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-alb-response-time-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-alb-unhealthy-hosts",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-eks-node-cpu-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-eks-pod-restarts-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-aurora-cpu-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-aurora-connections-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-redis-cpu-high",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-waf-blocked-spike",
-            "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project_name}-guardduty-high-findings"
+          title   = "ElastiCache Redis Memory Usage"
+          view    = "timeSeries"
+          region  = var.region
+          period  = 60
+          stat    = "Average"
+          metrics = [
+            ["AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "ReplicationGroupId", "${var.project_name}-redis"]
           ]
         }
       }

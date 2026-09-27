@@ -148,7 +148,7 @@ resource "aws_elasticache_replication_group" "ecommerce" {
   tags = {
     Name        = "${var.project_name}-redis"
     Environment = var.environment
-    Purpose     = "session-cache,cart-cache,rate-limits,idempotency"
+    Purpose     = "session-cache cart-cache rate-limits idempotency"
   }
 }
 
