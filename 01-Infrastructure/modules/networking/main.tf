@@ -51,7 +51,7 @@ resource "aws_subnet" "public" {
 # ==============================================
 resource "aws_subnet" "private" {
   count             = 3
-  vpc_id            = aws_vpc.this.id
+  vpc_id            = aws_vpc.ecommerce.id
   cidr_block        = var.private_subnets[count.index]
   availability_zone = var.azs[count.index]
 
@@ -70,7 +70,7 @@ resource "aws_subnet" "private" {
 # ==============================================
 resource "aws_subnet" "database" {
   count             = 3
-  vpc_id            = aws_vpc.this.id
+  vpc_id            = aws_vpc.ecommerce.id
   cidr_block        = var.database_subnets[count.index]
   availability_zone = var.azs[count.index]
 
@@ -116,7 +116,7 @@ resource "aws_nat_gateway" "ecommerce" {
 # Route Tables - Public
 # ==============================================
 resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.this.id
+  vpc_id = aws_vpc.ecommerce.id
 
   route {
     cidr_block = "0.0.0.0/0"
@@ -139,7 +139,7 @@ resource "aws_route_table_association" "public" {
 # Route Tables - Private
 # ==============================================
 resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.this.id
+  vpc_id = aws_vpc.ecommerce.id
 
   route {
     cidr_block     = "0.0.0.0/0"
@@ -170,7 +170,7 @@ resource "aws_route_table_association" "private" {
 # is safe for the database tier.
 # ==============================================
 resource "aws_route_table" "database" {
-  vpc_id = aws_vpc.this.id
+  vpc_id = aws_vpc.ecommerce.id
 
   route {
     cidr_block     = "0.0.0.0/0"
@@ -329,7 +329,7 @@ resource "aws_network_acl" "database" {
 resource "aws_security_group" "bastion" {
   name        = "${var.project_name}-bastion-sg"
   description = "SSH access for bastion host"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = aws_vpc.ecommerce.id
 
   ingress {
     description = "SSH"
@@ -360,7 +360,7 @@ resource "aws_security_group" "bastion" {
 resource "aws_security_group" "eks" {
   name        = "${var.project_name}-eks-sg"
   description = "EKS cluster security group"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = aws_vpc.ecommerce.id
 
   ingress {
     description = "Allow HTTPS from VPC"
@@ -395,7 +395,7 @@ resource "aws_security_group" "eks" {
 resource "aws_security_group" "aurora" {
   name        = "${var.project_name}-aurora-sg"
   description = "Aurora PostgreSQL access from private/db subnets"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = aws_vpc.ecommerce.id
 
   ingress {
     description     = "PostgreSQL from EKS nodes"
@@ -430,7 +430,7 @@ resource "aws_security_group" "aurora" {
 resource "aws_security_group" "jenkins" {
   name        = "${var.project_name}-jenkins-sg"
   description = "Jenkins server - HTTPS and Jenkins UI from bastion/VPC only"
-  vpc_id      = aws_vpc.this.id
+  vpc_id      = aws_vpc.ecommerce.id
 
   ingress {
     description     = "Jenkins UI (8080) from bastion"

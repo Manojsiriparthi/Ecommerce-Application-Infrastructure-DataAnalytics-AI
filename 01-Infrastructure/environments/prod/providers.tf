@@ -1,3 +1,7 @@
+terraform {
+  # required_providers block lives in backend.tf
+}
+
 provider "aws" {
   region = var.primary_region
 
@@ -10,7 +14,6 @@ provider "aws" {
   }
 }
 
-# DR region provider for Aurora Global Database
 provider "aws" {
   alias  = "dr"
   region = var.dr_region
@@ -20,23 +23,35 @@ provider "aws" {
       Project     = "pip-project-ecommerce"
       Environment = "prod"
       ManagedBy   = "terraform"
+      Region      = "DR"
     }
   }
 }
 
 # ==============================================
-# Helm and Kubernetes Providers
-# NOTE: These are configured with empty blocks initially.
-# After EKS cluster creation, use kubectl or aws eks CLI
-# to configure access. Terraform will automatically use
-# the credentials from your kubeconfig or AWS credentials.
+# Helm + Kubernetes — exec-based EKS auth
+# No ~/.kube/config needed. Token generated at runtime
+# using aws eks get-token via the same AWS credentials
+# already in the environment. Correct pattern for CI/CD.
 # ==============================================
+data "aws_eks_cluster" "ecommerce" {
+  name = "pip-project-ecommerce-cluster"
+}
+
+data "aws_eks_cluster_auth" "ecommerce" {
+  name = "pip-project-ecommerce-cluster"
+}
+
 provider "helm" {
   kubernetes {
-    config_path = "~/.kube/config"
+    host                   = data.aws_eks_cluster.ecommerce.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.ecommerce.token
   }
 }
 
 provider "kubernetes" {
-  config_path = "~/.kube/config"
+  host                   = data.aws_eks_cluster.ecommerce.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.ecommerce.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.ecommerce.token
 }
