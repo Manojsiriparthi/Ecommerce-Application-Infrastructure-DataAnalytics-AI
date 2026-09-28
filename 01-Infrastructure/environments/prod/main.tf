@@ -60,13 +60,14 @@ module "eks" {
   database_route_dependency = module.networking.database_route_table_association_ids
 
   # Worker nodes — t3.small to fit within 8 vCPU account limit
-  # 2×t3.small = 4 vCPU. Raise limit then change to t3.medium/desired=3
+  # 3×t3.small = 6 vCPU, one node per AZ for high availability
+  # Total: 6 (workers) + 1 (public t3.micro) = 7 vCPU — fits under 8 limit
   worker_instance_type = var.worker_instance_type
-  workers_desired      = 2
-  workers_min          = 2
+  workers_desired      = 3    # one node per AZ (us-east-1a, 1b, 1c)
+  workers_min          = 3
   workers_max          = 6
 
-  # Public nodes — t3.micro (1 vCPU, ALB support only)
+  # Public nodes — t3.micro (1 vCPU, ALB support only, no application pods)
   public_node_instance_type = var.public_node_instance_type
   public_desired            = 1
   public_min                = 1
@@ -104,6 +105,10 @@ module "eks_addons" {
 }
 
 module "compute" {
+  # Disabled while vCPU limit increase is pending.
+  # bastion (t3.micro=1 vCPU) + jenkins (t3.medium=2 vCPU) = 3 vCPU saved.
+  # Set enable_compute = true in prod.tfvars once limit is raised to 32.
+  count  = var.enable_compute ? 1 : 0
   source = "../../modules/compute"
 
   project_name                  = "pip-project-ecommerce"

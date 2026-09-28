@@ -182,3 +182,14 @@ variable "dr_database_subnets" {
   type        = list(string)
   default     = ["10.2.21.0/24", "10.2.22.0/24", "10.2.23.0/24"]
 }
+
+variable "enable_compute" {
+  description = <<-EOT
+    Set to true to create Bastion + Jenkins EC2 instances.
+    Disabled by default while vCPU account limit is pending increase.
+    Bastion = t3.micro (1 vCPU), Jenkins = t3.medium (2 vCPU) = 3 vCPU total.
+    Once EC2 vCPU limit is raised to 32, set this to true and re-apply.
+  EOT
+  type        = bool
+  default     = false
+}
