@@ -194,28 +194,29 @@ resource "aws_ssm_parameter" "ses_from_email" {
 resource "aws_guardduty_detector" "ecommerce" {
   enable = true
 
-  datasources {
-    s3_logs {
-      enable = true   # Detect malicious S3 access patterns
-    }
-    kubernetes {
-      audit_logs {
-        enable = true  # Detect unusual K8s API calls in EKS
-      }
-    }
-    malware_protection {
-      scan_ec2_instance_with_findings {
-        ebs_volumes {
-          enable = true  # Scan EBS volumes on threat detection
-        }
-      }
-    }
-  }
-
   tags = {
     Name        = "${var.project_name}-guardduty"
     Environment = var.environment
   }
+}
+
+# GuardDuty features — replaces deprecated datasources block
+resource "aws_guardduty_detector_feature" "s3_logs" {
+  detector_id = aws_guardduty_detector.ecommerce.id
+  name        = "S3_DATA_EVENTS"
+  status      = "ENABLED"
+}
+
+resource "aws_guardduty_detector_feature" "eks_audit" {
+  detector_id = aws_guardduty_detector.ecommerce.id
+  name        = "EKS_AUDIT_LOGS"
+  status      = "ENABLED"
+}
+
+resource "aws_guardduty_detector_feature" "malware" {
+  detector_id = aws_guardduty_detector.ecommerce.id
+  name        = "EBS_MALWARE_PROTECTION"
+  status      = "ENABLED"
 }
 
 # CloudWatch alarm - HIGH severity GuardDuty findings
