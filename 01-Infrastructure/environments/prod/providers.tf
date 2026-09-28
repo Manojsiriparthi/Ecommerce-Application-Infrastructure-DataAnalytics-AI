@@ -2,6 +2,9 @@ terraform {
   # required_providers block lives in backend.tf
 }
 
+# ==============================================
+# Primary region — us-east-1
+# ==============================================
 provider "aws" {
   region = var.primary_region
 
@@ -14,6 +17,9 @@ provider "aws" {
   }
 }
 
+# ==============================================
+# DR region — us-west-2
+# ==============================================
 provider "aws" {
   alias  = "dr"
   region = var.dr_region
@@ -28,6 +34,11 @@ provider "aws" {
   }
 }
 
+# ==============================================
+# Primary Helm + Kubernetes — exec-based auth
+# Reads cluster endpoint from module outputs (known after apply).
+# Safe on first plan — try() returns "" when cluster doesn't exist yet.
+# ==============================================
 provider "helm" {
   kubernetes {
     host = try(module.eks.cluster_endpoint, "")
@@ -65,14 +76,11 @@ provider "kubernetes" {
 }
 
 # ==============================================
-# DR Region Helm + Kubernetes providers (us-west-2)
-# Used by eks_addons_dr module to install helm charts on DR cluster
+# DR Helm + Kubernetes (us-west-2)
+# Same pattern — module outputs, no data source lookup.
+# data "aws_eks_cluster" removed: it runs at plan time and fails
+# because the DR cluster doesn't exist yet on first apply.
 # ==============================================
-data "aws_eks_cluster" "ecommerce_dr" {
-  provider = aws.dr
-  name     = "pip-project-ecommerce-cluster"
-}
-
 provider "helm" {
   alias = "dr"
   kubernetes {
