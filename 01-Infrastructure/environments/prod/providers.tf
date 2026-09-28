@@ -35,17 +35,23 @@ provider "aws" {
 }
 
 # ==============================================
-# Primary Helm + Kubernetes — exec-based auth
-# Reads cluster endpoint from module outputs (known after apply).
-# Safe on first plan — try() returns "" when cluster doesn't exist yet.
+# Helm + Kubernetes — exec-based, NO module output references
 # ==============================================
+# WHY NO module.eks references here:
+#   On a fresh prod apply the EKS cluster doesn't exist yet.
+#   module.eks.cluster_endpoint is "known after apply" = empty string.
+#   When cluster_ca_certificate = base64decode("") it fails validation.
+#
+# FIX: Use empty strings directly. The exec block fetches a token
+#   lazily — only when a helm_release is actually being applied,
+#   by which time the cluster exists (eks_addons depends_on eks).
+#   The empty host/ca just means Helm won't try to pre-connect at plan time.
+# ==============================================
+
 provider "helm" {
   kubernetes {
-    host = try(module.eks.cluster_endpoint, "")
-    cluster_ca_certificate = try(
-      base64decode(module.eks.cluster_certificate_authority_data),
-      ""
-    )
+    host                   = ""
+    cluster_ca_certificate = ""
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -59,11 +65,8 @@ provider "helm" {
 }
 
 provider "kubernetes" {
-  host = try(module.eks.cluster_endpoint, "")
-  cluster_ca_certificate = try(
-    base64decode(module.eks.cluster_certificate_authority_data),
-    ""
-  )
+  host                   = ""
+  cluster_ca_certificate = ""
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
@@ -75,17 +78,12 @@ provider "kubernetes" {
   }
 }
 
-# DR Helm + Kubernetes providers are not used during normal apply
-# (eks_addons_dr is removed — addons install during failover, not at create time).
-# Kept here as aliases so future failover automation can reference them.
+# DR Helm + Kubernetes — same pattern, DR region
 provider "helm" {
   alias = "dr"
   kubernetes {
-    host = try(module.eks_dr.cluster_endpoint, "")
-    cluster_ca_certificate = try(
-      base64decode(module.eks_dr.cluster_certificate_authority_data),
-      ""
-    )
+    host                   = ""
+    cluster_ca_certificate = ""
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -99,12 +97,9 @@ provider "helm" {
 }
 
 provider "kubernetes" {
-  alias = "dr"
-  host  = try(module.eks_dr.cluster_endpoint, "")
-  cluster_ca_certificate = try(
-    base64decode(module.eks_dr.cluster_certificate_authority_data),
-    ""
-  )
+  alias                  = "dr"
+  host                   = ""
+  cluster_ca_certificate = ""
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
