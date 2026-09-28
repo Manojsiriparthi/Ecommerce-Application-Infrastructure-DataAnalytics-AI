@@ -59,13 +59,14 @@ module "eks" {
   private_route_dependency  = module.networking.private_route_table_association_ids
   database_route_dependency = module.networking.database_route_table_association_ids
 
-  # Worker nodes — larger instances for prod traffic
+  # Worker nodes — t3.small to fit within 8 vCPU account limit
+  # 2×t3.small = 4 vCPU. Raise limit then change to t3.medium/desired=3
   worker_instance_type = var.worker_instance_type
-  workers_desired      = 3
-  workers_min          = 3
-  workers_max          = 10
+  workers_desired      = 2
+  workers_min          = 2
+  workers_max          = 6
 
-  # Public nodes — 1 per AZ for ALB ip-mode support
+  # Public nodes — t3.micro (1 vCPU, ALB support only)
   public_node_instance_type = var.public_node_instance_type
   public_desired            = 1
   public_min                = 1
@@ -237,36 +238,16 @@ module "monitoring" {
 }
 
 # ==============================================
+# ==============================================
 # DR REGION (us-west-2) — WARM STANDBY
 # ==============================================
-# ACTIVE-PASSIVE DR STRATEGY:
-#
-#   PRIMARY (us-east-1) — fully active, serves all traffic
-#   PASSIVE (us-west-2) — warm standby, ready to activate
-#
-#   What runs in us-west-2 permanently (~$280/month extra):
-#     ✅ VPC + subnets + networking         (~$5/month)
-#     ✅ EKS cluster control plane only     (~$72/month)
-#        └─ 0 worker nodes by default
-#        └─ Spin up nodes in ~5 min during failover
-#     ✅ Aurora Global DB secondary         (~$187/month, already in aurora module)
-#     ✅ IAM roles (same roles, DR region)  (~$0)
-#
-#   What is NOT running in us-west-2 until failover:
-#     ❌ EKS worker nodes  → created in 5 min via aws eks update-nodegroup
-#     ❌ Application pods  → deployed in 3 min via ArgoCD sync
-#     ❌ ALB              → created in 2 min when Ingress is applied
-#
-#   Total failover time: ~10 minutes
-#   (Route53 DNS switch: 2 min, nodes: 5 min, pods: 3 min)
-#
-# WHY WARM STANDBY AND NOT COLD:
-#   Cold standby = terraform apply during incident (~35 min EKS creation)
-#   Warm standby = node group scale-out during incident (~5 min)
-#   The 30-minute difference matters when users are seeing errors.
+# IAM NOTE: IAM is a GLOBAL service — role names must be unique per account,
+# not per region. The primary cluster's IAM roles (module.iam) work perfectly
+# for the DR cluster too. No need for module.iam_dr — just pass the same
+# role ARNs from module.iam to module.eks_dr.
 # ==============================================
 
-# DR Networking (us-west-2)
+# DR Networking (us-west-2) — different CIDR to avoid overlap
 module "networking_dr" {
   source = "../../modules/networking"
 
@@ -283,23 +264,9 @@ module "networking_dr" {
   database_subnets = var.dr_database_subnets
 }
 
-# DR IAM roles — same permissions, DR region
-module "iam_dr" {
-  source = "../../modules/iam"
-
-  providers = {
-    aws = aws.dr
-  }
-
-  project_name = "pip-project-ecommerce"
-  environment  = "${var.environment}-dr"
-
-  depends_on = [module.networking_dr]
-}
-
-# DR EKS — control plane only, 0 worker nodes
-# Workers are added during failover via:
-#   aws eks update-nodegroup-config --desired-size 3
+# DR EKS — uses the SAME IAM roles as primary (IAM is global)
+# t3.micro nodes keep CoreDNS healthy without consuming many vCPUs
+# vCPU cost: 2×t3.micro = 2 vCPU (fits within 8 vCPU account limit)
 module "eks_dr" {
   source = "../../modules/eks"
 
@@ -307,50 +274,40 @@ module "eks_dr" {
     aws = aws.dr
   }
 
-  project_name              = "pip-project-ecommerce"
-  environment               = "${var.environment}-dr"
-  cluster_version           = var.eks_cluster_version
-  cluster_role_arn          = module.iam_dr.cluster_role_arn
-  node_role_arn             = module.iam_dr.node_role_arn
+  project_name   = "pip-project-ecommerce"
+  environment    = "${var.environment}-dr"
+  cluster_version = var.eks_cluster_version
+
+  # ── REUSE PRIMARY IAM ROLES — no separate iam_dr module needed ──
+  # IAM roles are global. The same role ARN works in any region.
+  cluster_role_arn = module.iam.cluster_role_arn
+  node_role_arn    = module.iam.node_role_arn
+
   private_subnet_ids        = module.networking_dr.private_subnet_ids
   public_subnet_ids         = module.networking_dr.public_subnet_ids
   db_subnet_ids             = module.networking_dr.database_subnet_ids
   private_route_dependency  = module.networking_dr.private_route_table_association_ids
   database_route_dependency = module.networking_dr.database_route_table_association_ids
 
-  # DR WARM STANDBY — t3.micro nodes always running
-  # Cost: 3 x t3.micro = ~$22/month total (very cheap)
-  # Why t3.micro and not 0 nodes:
-  #   - 0 nodes → coredns/kube-proxy addons hang → Terraform times out at 11+ min
-  #   - t3.micro → cluster stays healthy, addons run, zero apply hangs
-  #
-  # DURING FAILOVER — upgrade nodes with zero downtime:
-  #   Step 1: Change worker_instance_type to "t3.medium" in prod.tfvars
-  #   Step 2: terraform apply → rolling replace (new medium joins, old micro deleted)
-  #   Step 3: Pods move to new nodes automatically — no downtime
-  #
-  # Rolling replace works because:
-  #   - New node joins first (desired increases by 1)
-  #   - Pods reschedule to new node
-  #   - Old node is cordoned + drained + terminated
-  #   - Kubernetes PodDisruptionBudget ensures min 1 replica stays up throughout
-  worker_instance_type = "t3.micro"   # standby — upgrade to t3.medium during failover
-  workers_desired      = 1            # 1 node per cluster (enough for CoreDNS + system pods)
+  # t3.micro — just enough for CoreDNS + system pods to stay healthy
+  # During failover: change to t3.medium + desired=3 → rolling replace, zero downtime
+  worker_instance_type = "t3.micro"
+  workers_desired      = 1
   workers_min          = 1
-  workers_max          = 10           # scale to 10 during full failover
+  workers_max          = 10
 
-  public_node_instance_type = "t3.micro"  # ALB support — upgrades with workers
+  public_node_instance_type = "t3.micro"
   public_desired            = 1
   public_min                = 1
   public_max                = 3
 
   create_db_nodes = false
 
-  depends_on = [module.iam_dr, module.networking_dr]
+  depends_on = [module.iam, module.networking_dr]
 }
 
-# DR IRSA — needed so pods can access Secrets Manager, SSM in us-west-2
-# Created now so IAM roles exist when failover happens.
+# DR IRSA — OIDC-bound roles for pods in the DR cluster
+# These are separate because each EKS cluster has its own OIDC endpoint
 module "iam_irsa_dr" {
   source = "../../modules/iam-irsa"
 
@@ -358,27 +315,15 @@ module "iam_irsa_dr" {
     aws = aws.dr
   }
 
-  project_name      = "pip-project-ecommerce"
+  # Use -dr suffix so IRSA role names don't clash with primary region IRSA roles
+  # (IRSA roles include the OIDC URL in their trust policy, so they must be separate)
+  project_name      = "pip-project-ecommerce-dr"
   environment       = "${var.environment}-dr"
   oidc_provider_arn = module.eks_dr.oidc_provider_arn
   oidc_provider_url = replace(module.eks_dr.oidc_provider_url, "https://", "")
 
   depends_on = [module.eks_dr]
 }
-
-# NOTE: eks_addons_dr (LB Controller, Cluster Autoscaler, Secrets Store CSI,
-# Fluent Bit, VPA) is intentionally NOT installed here.
-#
-# WHY: With workers_desired=0 the coredns and kube-proxy EKS addons
-# (installed inside eks_dr module) hang waiting for nodes. Helm-based
-# addons would also hang. Installing addons on a 0-node cluster wastes
-# ~20 minutes of apply time and always times out.
-#
-# DURING FAILOVER: After scaling nodes to 3, run:
-#   aws eks update-kubeconfig --name pip-project-ecommerce-cluster --region us-west-2
-#   helm upgrade --install aws-load-balancer-controller ... (see disaster-recovery.md)
-# OR: ArgoCD in the DR cluster will install everything automatically when
-# it syncs the 03-Kubernetes/ manifests after failover.
 
 # Wire DR networking into Aurora module
 # (already configured in the aurora module call above via dr_* variables)
