@@ -148,3 +148,37 @@ variable "alb_dns_name" {
   type        = string
   default     = ""
 }
+
+# ==============================================
+# DR Region Networking (us-west-2)
+# Different CIDRs to avoid overlap if VPC peering is needed later
+# ==============================================
+variable "dr_vpc_cidr" {
+  description = "VPC CIDR for DR region (us-west-2)"
+  type        = string
+  default     = "10.2.0.0/16"
+}
+
+variable "dr_azs" {
+  description = "Availability zones in DR region"
+  type        = list(string)
+  default     = ["us-west-2a", "us-west-2b", "us-west-2c"]
+}
+
+variable "dr_public_subnets" {
+  description = "Public subnet CIDRs in DR region"
+  type        = list(string)
+  default     = ["10.2.1.0/24", "10.2.2.0/24", "10.2.3.0/24"]
+}
+
+variable "dr_private_subnets" {
+  description = "Private subnet CIDRs in DR region"
+  type        = list(string)
+  default     = ["10.2.11.0/24", "10.2.12.0/24", "10.2.13.0/24"]
+}
+
+variable "dr_database_subnets" {
+  description = "Database subnet CIDRs in DR region"
+  type        = list(string)
+  default     = ["10.2.21.0/24", "10.2.22.0/24", "10.2.23.0/24"]
+}

@@ -41,7 +41,8 @@ module "security" {
   jwt_secret           = var.jwt_secret
   internal_service_key = var.internal_service_key
   ses_from_email       = var.ses_from_email
-  vpc_id               = module.networking.vpc_id   # enables VPC Flow Logs
+  vpc_id               = module.networking.vpc_id
+  create_flow_logs     = true   # boolean — safe to evaluate at plan time
 
   depends_on = [module.networking]
 }

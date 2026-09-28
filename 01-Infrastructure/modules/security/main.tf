@@ -301,9 +301,13 @@ resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   }
 }
 
-# Flow log resource - vpc_id passed in as variable
+# Flow log resource
+# Uses a boolean variable instead of checking vpc_id at count time.
+# Terraform can evaluate a variable at plan time but cannot evaluate
+# a resource attribute (module.networking.vpc_id) — that causes the
+# "count depends on resource attributes" error.
 resource "aws_flow_log" "ecommerce" {
-  count           = var.vpc_id != "" ? 1 : 0
+  count = var.create_flow_logs ? 1 : 0
 
   iam_role_arn    = aws_iam_role.vpc_flow_logs.arn
   log_destination = aws_cloudwatch_log_group.vpc_flow_logs.arn

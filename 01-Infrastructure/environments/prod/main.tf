@@ -30,7 +30,8 @@ module "security" {
   jwt_secret           = var.jwt_secret
   internal_service_key = var.internal_service_key
   ses_from_email       = var.ses_from_email
-  vpc_id               = module.networking.vpc_id   # enables VPC Flow Logs
+  vpc_id               = module.networking.vpc_id
+  create_flow_logs     = true   # boolean — safe to evaluate at plan time
 
   depends_on = [module.networking]
 }
@@ -153,7 +154,11 @@ module "aurora" {
   primary_region   = var.primary_region
   dr_region        = var.dr_region
 
-  depends_on = [module.networking, module.security, module.messaging]
+  # Wire DR networking outputs so Aurora Global DB secondary gets its subnet + SG
+  dr_db_subnet_group_name = module.networking_dr.db_subnet_group_name
+  dr_aurora_sg_id         = module.networking_dr.aurora_sg_id
+
+  depends_on = [module.networking, module.security, module.messaging, module.networking_dr]
 }
 
 module "elasticache" {
@@ -230,3 +235,148 @@ module "monitoring" {
 
   depends_on = [module.messaging, module.networking, module.eks_addons]
 }
+
+# ==============================================
+# DR REGION (us-west-2) — WARM STANDBY
+# ==============================================
+# ACTIVE-PASSIVE DR STRATEGY:
+#
+#   PRIMARY (us-east-1) — fully active, serves all traffic
+#   PASSIVE (us-west-2) — warm standby, ready to activate
+#
+#   What runs in us-west-2 permanently (~$280/month extra):
+#     ✅ VPC + subnets + networking         (~$5/month)
+#     ✅ EKS cluster control plane only     (~$72/month)
+#        └─ 0 worker nodes by default
+#        └─ Spin up nodes in ~5 min during failover
+#     ✅ Aurora Global DB secondary         (~$187/month, already in aurora module)
+#     ✅ IAM roles (same roles, DR region)  (~$0)
+#
+#   What is NOT running in us-west-2 until failover:
+#     ❌ EKS worker nodes  → created in 5 min via aws eks update-nodegroup
+#     ❌ Application pods  → deployed in 3 min via ArgoCD sync
+#     ❌ ALB              → created in 2 min when Ingress is applied
+#
+#   Total failover time: ~10 minutes
+#   (Route53 DNS switch: 2 min, nodes: 5 min, pods: 3 min)
+#
+# WHY WARM STANDBY AND NOT COLD:
+#   Cold standby = terraform apply during incident (~35 min EKS creation)
+#   Warm standby = node group scale-out during incident (~5 min)
+#   The 30-minute difference matters when users are seeing errors.
+# ==============================================
+
+# DR Networking (us-west-2)
+module "networking_dr" {
+  source = "../../modules/networking"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  project_name     = "pip-project-ecommerce"
+  environment      = "${var.environment}-dr"
+  vpc_cidr         = var.dr_vpc_cidr
+  azs              = var.dr_azs
+  public_subnets   = var.dr_public_subnets
+  private_subnets  = var.dr_private_subnets
+  database_subnets = var.dr_database_subnets
+}
+
+# DR IAM roles — same permissions, DR region
+module "iam_dr" {
+  source = "../../modules/iam"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  project_name = "pip-project-ecommerce"
+  environment  = "${var.environment}-dr"
+
+  depends_on = [module.networking_dr]
+}
+
+# DR EKS — control plane only, 0 worker nodes
+# Workers are added during failover via:
+#   aws eks update-nodegroup-config --desired-size 3
+module "eks_dr" {
+  source = "../../modules/eks"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  project_name              = "pip-project-ecommerce"
+  environment               = "${var.environment}-dr"
+  cluster_version           = var.eks_cluster_version
+  cluster_role_arn          = module.iam_dr.cluster_role_arn
+  node_role_arn             = module.iam_dr.node_role_arn
+  private_subnet_ids        = module.networking_dr.private_subnet_ids
+  public_subnet_ids         = module.networking_dr.public_subnet_ids
+  db_subnet_ids             = module.networking_dr.database_subnet_ids
+  private_route_dependency  = module.networking_dr.private_route_table_association_ids
+  database_route_dependency = module.networking_dr.database_route_table_association_ids
+
+  # WARM STANDBY: 0 nodes running normally = save cost
+  # During failover: scale to 3 via AWS CLI (takes ~5 minutes)
+  # Command: aws eks update-nodegroup-config \
+  #   --cluster-name pip-project-ecommerce-cluster \
+  #   --nodegroup-name pip-project-ecommerce-workers \
+  #   --scaling-config desiredSize=3,minSize=3,maxSize=10 \
+  #   --region us-west-2
+  worker_instance_type = var.worker_instance_type
+  workers_desired      = 0    # 0 nodes = no cost for EC2, EKS control plane still runs
+  workers_min          = 0
+  workers_max          = 10   # Can scale to 10 during failover
+
+  public_node_instance_type = var.public_node_instance_type
+  public_desired            = 0
+  public_min                = 0
+  public_max                = 3
+
+  create_db_nodes = false
+
+  depends_on = [module.iam_dr, module.networking_dr]
+}
+
+# DR IRSA — needed so pods can access Secrets Manager, SSM in us-west-2
+module "iam_irsa_dr" {
+  source = "../../modules/iam-irsa"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  project_name      = "pip-project-ecommerce"
+  environment       = "${var.environment}-dr"
+  oidc_provider_arn = module.eks_dr.oidc_provider_arn
+  oidc_provider_url = replace(module.eks_dr.oidc_provider_url, "https://", "")
+
+  depends_on = [module.eks_dr]
+}
+
+# DR EKS addons — installed so cluster is ready to receive pods immediately
+module "eks_addons_dr" {
+  source = "../../modules/eks-addons"
+
+  providers = {
+    helm       = helm.dr
+    kubernetes = kubernetes.dr
+    aws        = aws.dr
+  }
+
+  project_name                = "pip-project-ecommerce"
+  cluster_name                = module.eks_dr.cluster_name
+  region                      = var.dr_region
+  ebs_csi_role_arn            = module.iam_irsa_dr.ebs_csi_role_arn
+  lb_controller_role_arn      = module.iam_irsa_dr.lb_controller_role_arn
+  cluster_autoscaler_role_arn = module.iam_irsa_dr.cluster_autoscaler_role_arn
+  secrets_store_csi_role_arn  = module.iam_irsa_dr.secrets_store_csi_role_arn
+
+  depends_on = [module.eks_dr, module.iam_irsa_dr]
+}
+
+# Wire DR networking into Aurora module
+# The aurora module receives DR subnet group + SG via these outputs
+# (already configured in the aurora module call above via dr_* variables)

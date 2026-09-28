@@ -38,3 +38,14 @@ variable "vpc_id" {
   type        = string
   default     = ""
 }
+
+variable "create_flow_logs" {
+  description = <<-EOT
+    Set to true to enable VPC Flow Logs to CloudWatch.
+    Must be true when vpc_id is set.
+    Kept as a separate boolean so Terraform can evaluate count at plan time
+    (resource attribute values like vpc_id cannot be used in count directly).
+  EOT
+  type        = bool
+  default     = false
+}
