@@ -96,6 +96,7 @@ module "eks_addons" {
   project_name                = "pip-project-ecommerce"
   cluster_name                = module.eks.cluster_name
   region                      = var.primary_region
+  vpc_id                      = module.networking.vpc_id
   ebs_csi_role_arn            = module.iam_irsa.ebs_csi_role_arn
   lb_controller_role_arn      = module.iam_irsa.lb_controller_role_arn
   cluster_autoscaler_role_arn = module.iam_irsa.cluster_autoscaler_role_arn

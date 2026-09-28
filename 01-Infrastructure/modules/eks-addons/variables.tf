@@ -33,3 +33,8 @@ variable "secrets_store_csi_role_arn" {
   description = "IRSA role ARN for the Secrets Store CSI driver provider"
   type        = string
 }
+
+variable "vpc_id" {
+  description = "VPC ID — passed explicitly to LB controller so it works when IMDSv2 blocks EC2 metadata auto-detection"
+  type        = string
+}

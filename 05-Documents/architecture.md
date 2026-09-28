@@ -9,6 +9,8 @@
 
 ---
 
+![alt text](image.png)
+
 ## Table of Contents
 
 1. [What We Are Building](#1-what-we-are-building)
@@ -25,7 +27,7 @@
 12. [draw.io Diagram Prompt](#12-drawio-diagram-prompt)
 
 ---
-
+<video controls src="WhatsApp Video 2026-09-29 at 01.46.43.mp4" title="Title"></video>
 ## 1. What We Are Building
 
 We are building an **e-commerce web application** that allows users to browse products, add items to a cart, make payments, and receive order notifications.

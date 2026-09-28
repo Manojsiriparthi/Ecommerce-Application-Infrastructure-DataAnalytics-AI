@@ -50,11 +50,8 @@ metadata:
     # Replace with actual IDs from terraform output module.networking.private_subnet_ids
     alb.ingress.kubernetes.io/subnets: "<PRIVATE_SUBNET_ID_1>,<PRIVATE_SUBNET_ID_2>,<PRIVATE_SUBNET_ID_3>"
 
-    # ALB access logs → same S3 bucket, different prefix
+    # ALB access logs disabled — S3 bucket policy needs ELB service account first
     alb.ingress.kubernetes.io/load-balancer-attributes: >-
-      access_logs.s3.enabled=true,
-      access_logs.s3.bucket=<LOGS_BUCKET_NAME>,
-      access_logs.s3.prefix=alb-logs-internal,
       idle_timeout.timeout_seconds=60,
       routing.http2.enabled=true
 

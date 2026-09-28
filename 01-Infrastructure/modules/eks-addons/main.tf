@@ -29,6 +29,12 @@ resource "helm_release" "lb_controller" {
     name  = "region"
     value = var.region
   }
+  # Explicitly pass VPC ID — required when IMDSv2 is enforced (EC2MetadataError 401)
+  # Without this the controller tries to auto-detect from instance metadata and fails
+  set {
+    name  = "vpcId"
+    value = var.vpc_id
+  }
   set {
     name  = "serviceAccount.create"
     value = "true"

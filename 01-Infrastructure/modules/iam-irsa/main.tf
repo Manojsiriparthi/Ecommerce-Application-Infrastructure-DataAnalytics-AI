@@ -62,6 +62,58 @@ resource "aws_iam_role_policy_attachment" "lb_controller" {
   role       = aws_iam_role.lb_controller.name
 }
 
+# Additional EC2 permissions required by ALB controller to create/manage
+# security groups for ALBs. Without this: ec2:CreateSecurityGroup 403 error.
+resource "aws_iam_policy" "lb_controller_ec2" {
+  name        = "${var.project_name}-lb-controller-ec2-policy"
+  description = "EC2 permissions for AWS Load Balancer Controller to manage ALB security groups"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeAccountAttributes",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "wafv2:GetWebACL",
+        "wafv2:GetWebACLForResource",
+        "wafv2:AssociateWebACL",
+        "wafv2:DisassociateWebACL",
+        "wafv2:ListResourcesForWebACL",
+        "shield:GetSubscriptionState",
+        "cognito-idp:DescribeUserPoolClient",
+        "acm:ListCertificates",
+        "acm:DescribeCertificate",
+        "iam:CreateServiceLinkedRole",
+        "tag:GetResources",
+        "tag:TagResources"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lb_controller_ec2" {
+  policy_arn = aws_iam_policy.lb_controller_ec2.arn
+  role       = aws_iam_role.lb_controller.name
+}
+
 # ==============================================
 # Cluster Autoscaler IRSA Role
 # ==============================================

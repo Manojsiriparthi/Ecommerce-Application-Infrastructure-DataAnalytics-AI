@@ -38,14 +38,12 @@ metadata:
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
     alb.ingress.kubernetes.io/ssl-redirect: "443"
 
-    # ALB access logs → S3 (bucket = Terraform output module.waf.logs_bucket_name)
+    # ALB access logs disabled — S3 bucket policy needs ELB service account to be configured first
+    # Re-enable after running: terraform apply -target=module.waf
     alb.ingress.kubernetes.io/load-balancer-attributes: >-
-      access_logs.s3.enabled=true,
-      access_logs.s3.bucket=<LOGS_BUCKET_NAME>,
-      access_logs.s3.prefix=alb-logs,
       idle_timeout.timeout_seconds=60,
       routing.http2.enabled=true,
-      deletion_protection.enabled=true
+      deletion_protection.enabled=false
 
     # Target group stickiness — rubric requirement
     # Keeps the same user on the same pod for session consistency
