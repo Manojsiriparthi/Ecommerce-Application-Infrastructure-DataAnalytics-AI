@@ -2,9 +2,6 @@ terraform {
   # required_providers block lives in backend.tf
 }
 
-# ==============================================
-# Primary region — us-east-1
-# ==============================================
 provider "aws" {
   region = var.primary_region
 
@@ -17,9 +14,6 @@ provider "aws" {
   }
 }
 
-# ==============================================
-# DR region — us-west-2
-# ==============================================
 provider "aws" {
   alias  = "dr"
   region = var.dr_region
@@ -35,23 +29,17 @@ provider "aws" {
 }
 
 # ==============================================
-# Helm + Kubernetes — exec-based, NO module output references
+# Helm + Kubernetes — exec-only, no host/ca
 # ==============================================
-# WHY NO module.eks references here:
-#   On a fresh prod apply the EKS cluster doesn't exist yet.
-#   module.eks.cluster_endpoint is "known after apply" = empty string.
-#   When cluster_ca_certificate = base64decode("") it fails validation.
-#
-# FIX: Use empty strings directly. The exec block fetches a token
-#   lazily — only when a helm_release is actually being applied,
-#   by which time the cluster exists (eks_addons depends_on eks).
-#   The empty host/ca just means Helm won't try to pre-connect at plan time.
+# WHY no host or cluster_ca_certificate:
+#   Setting host="" causes "no configuration provided" error in Helm provider.
+#   The correct pattern (same as dev) is exec-only — aws eks get-token
+#   fetches both the endpoint and token dynamically at apply time.
+#   This works because eks_addons depends_on eks, so cluster exists first.
 # ==============================================
 
 provider "helm" {
   kubernetes {
-    host                   = ""
-    cluster_ca_certificate = ""
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -65,8 +53,6 @@ provider "helm" {
 }
 
 provider "kubernetes" {
-  host                   = ""
-  cluster_ca_certificate = ""
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
@@ -78,12 +64,9 @@ provider "kubernetes" {
   }
 }
 
-# DR Helm + Kubernetes — same pattern, DR region
 provider "helm" {
   alias = "dr"
   kubernetes {
-    host                   = ""
-    cluster_ca_certificate = ""
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -97,9 +80,7 @@ provider "helm" {
 }
 
 provider "kubernetes" {
-  alias                  = "dr"
-  host                   = ""
-  cluster_ca_certificate = ""
+  alias = "dr"
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"

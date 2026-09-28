@@ -33,14 +33,13 @@ resource "aws_rds_cluster" "secondary" {
   db_subnet_group_name      = var.dr_db_subnet_group_name
   vpc_security_group_ids    = [var.dr_aurora_sg_id]
   storage_encrypted         = true
-  kms_key_id                = var.dr_kms_key_arn
+  # For cross-region encrypted Global DB, a KMS key in the DR region is required.
+  # Use dr_kms_key_arn if provided; otherwise fall back to the AWS-managed RDS key
+  # (alias/aws/rds) which always exists in every region at no extra cost.
+  kms_key_id                = var.dr_kms_key_arn != "" ? var.dr_kms_key_arn : null
   skip_final_snapshot       = true
 
-  # NOTE: master_username/master_password are intentionally NOT set here.
-  # A Global Database secondary cluster inherits authentication from the
-  # primary cluster automatically - setting credentials here is invalid.
   lifecycle {
-
     ignore_changes = [engine_version]
   }
 }
