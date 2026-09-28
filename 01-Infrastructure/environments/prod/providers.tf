@@ -75,12 +75,9 @@ provider "kubernetes" {
   }
 }
 
-# ==============================================
-# DR Helm + Kubernetes (us-west-2)
-# Same pattern — module outputs, no data source lookup.
-# data "aws_eks_cluster" removed: it runs at plan time and fails
-# because the DR cluster doesn't exist yet on first apply.
-# ==============================================
+# DR Helm + Kubernetes providers are not used during normal apply
+# (eks_addons_dr is removed — addons install during failover, not at create time).
+# Kept here as aliases so future failover automation can reference them.
 provider "helm" {
   alias = "dr"
   kubernetes {

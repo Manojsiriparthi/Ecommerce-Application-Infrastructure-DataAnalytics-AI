@@ -318,21 +318,30 @@ module "eks_dr" {
   private_route_dependency  = module.networking_dr.private_route_table_association_ids
   database_route_dependency = module.networking_dr.database_route_table_association_ids
 
-  # WARM STANDBY: 0 nodes running normally = save cost
-  # During failover: scale to 3 via AWS CLI (takes ~5 minutes)
-  # Command: aws eks update-nodegroup-config \
-  #   --cluster-name pip-project-ecommerce-cluster \
-  #   --nodegroup-name pip-project-ecommerce-workers \
-  #   --scaling-config desiredSize=3,minSize=3,maxSize=10 \
-  #   --region us-west-2
-  worker_instance_type = var.worker_instance_type
-  workers_desired      = 0    # 0 nodes = no cost for EC2, EKS control plane still runs
-  workers_min          = 0
-  workers_max          = 10   # Can scale to 10 during failover
+  # DR WARM STANDBY — t3.micro nodes always running
+  # Cost: 3 x t3.micro = ~$22/month total (very cheap)
+  # Why t3.micro and not 0 nodes:
+  #   - 0 nodes → coredns/kube-proxy addons hang → Terraform times out at 11+ min
+  #   - t3.micro → cluster stays healthy, addons run, zero apply hangs
+  #
+  # DURING FAILOVER — upgrade nodes with zero downtime:
+  #   Step 1: Change worker_instance_type to "t3.medium" in prod.tfvars
+  #   Step 2: terraform apply → rolling replace (new medium joins, old micro deleted)
+  #   Step 3: Pods move to new nodes automatically — no downtime
+  #
+  # Rolling replace works because:
+  #   - New node joins first (desired increases by 1)
+  #   - Pods reschedule to new node
+  #   - Old node is cordoned + drained + terminated
+  #   - Kubernetes PodDisruptionBudget ensures min 1 replica stays up throughout
+  worker_instance_type = "t3.micro"   # standby — upgrade to t3.medium during failover
+  workers_desired      = 1            # 1 node per cluster (enough for CoreDNS + system pods)
+  workers_min          = 1
+  workers_max          = 10           # scale to 10 during full failover
 
-  public_node_instance_type = var.public_node_instance_type
-  public_desired            = 0
-  public_min                = 0
+  public_node_instance_type = "t3.micro"  # ALB support — upgrades with workers
+  public_desired            = 1
+  public_min                = 1
   public_max                = 3
 
   create_db_nodes = false
@@ -341,6 +350,7 @@ module "eks_dr" {
 }
 
 # DR IRSA — needed so pods can access Secrets Manager, SSM in us-west-2
+# Created now so IAM roles exist when failover happens.
 module "iam_irsa_dr" {
   source = "../../modules/iam-irsa"
 
@@ -356,27 +366,19 @@ module "iam_irsa_dr" {
   depends_on = [module.eks_dr]
 }
 
-# DR EKS addons — installed so cluster is ready to receive pods immediately
-module "eks_addons_dr" {
-  source = "../../modules/eks-addons"
-
-  providers = {
-    helm       = helm.dr
-    kubernetes = kubernetes.dr
-    aws        = aws.dr
-  }
-
-  project_name                = "pip-project-ecommerce"
-  cluster_name                = module.eks_dr.cluster_name
-  region                      = var.dr_region
-  ebs_csi_role_arn            = module.iam_irsa_dr.ebs_csi_role_arn
-  lb_controller_role_arn      = module.iam_irsa_dr.lb_controller_role_arn
-  cluster_autoscaler_role_arn = module.iam_irsa_dr.cluster_autoscaler_role_arn
-  secrets_store_csi_role_arn  = module.iam_irsa_dr.secrets_store_csi_role_arn
-
-  depends_on = [module.eks_dr, module.iam_irsa_dr]
-}
+# NOTE: eks_addons_dr (LB Controller, Cluster Autoscaler, Secrets Store CSI,
+# Fluent Bit, VPA) is intentionally NOT installed here.
+#
+# WHY: With workers_desired=0 the coredns and kube-proxy EKS addons
+# (installed inside eks_dr module) hang waiting for nodes. Helm-based
+# addons would also hang. Installing addons on a 0-node cluster wastes
+# ~20 minutes of apply time and always times out.
+#
+# DURING FAILOVER: After scaling nodes to 3, run:
+#   aws eks update-kubeconfig --name pip-project-ecommerce-cluster --region us-west-2
+#   helm upgrade --install aws-load-balancer-controller ... (see disaster-recovery.md)
+# OR: ArgoCD in the DR cluster will install everything automatically when
+# it syncs the 03-Kubernetes/ manifests after failover.
 
 # Wire DR networking into Aurora module
-# The aurora module receives DR subnet group + SG via these outputs
 # (already configured in the aurora module call above via dr_* variables)
