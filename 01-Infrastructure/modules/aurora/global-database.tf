@@ -1,10 +1,6 @@
 # ==============================================
 # Aurora Global Database (Cross-Region DR)
 # ==============================================
-# NOTE: This resource is defined in the primary region provider.
-# The secondary cluster must be created using aws.dr provider alias
-# passed from the root module (see environments/*/main.tf).
-
 resource "aws_rds_global_cluster" "ecommerce" {
   global_cluster_identifier = "${var.project_name}-global-db"
   engine                    = "aurora-postgresql"
@@ -18,9 +14,34 @@ resource "aws_rds_global_cluster" "ecommerce" {
 }
 
 # ==============================================
+# KMS key in DR region for encrypted Global DB replica
+# AWS REQUIRES an explicit KMS key for cross-region encrypted replicas.
+# "null" or omitting kms_key_id is rejected with InvalidParameterCombination.
+# This key is created in the DR region using the aws.dr provider alias.
+# ==============================================
+resource "aws_kms_key" "dr_aurora" {
+  count    = var.enable_global_db ? 1 : 0
+  provider = aws.dr
+
+  description             = "KMS key for Aurora Global DB secondary cluster in DR region"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = {
+    Name        = "${var.project_name}-aurora-dr-kms"
+    Environment = "dr"
+  }
+}
+
+resource "aws_kms_alias" "dr_aurora" {
+  count         = var.enable_global_db ? 1 : 0
+  provider      = aws.dr
+  name          = "alias/${var.project_name}-aurora-dr"
+  target_key_id = aws_kms_key.dr_aurora[0].key_id
+}
+
+# ==============================================
 # Secondary Cluster (DR Region)
-# Deployed only when var.enable_global_db = true
-# Uses provider alias "aws.dr" passed from root module
 # ==============================================
 resource "aws_rds_cluster" "secondary" {
   count = var.enable_global_db ? 1 : 0
@@ -33,11 +54,9 @@ resource "aws_rds_cluster" "secondary" {
   db_subnet_group_name      = var.dr_db_subnet_group_name
   vpc_security_group_ids    = [var.dr_aurora_sg_id]
   storage_encrypted         = true
-  # For cross-region encrypted Global DB, a KMS key in the DR region is required.
-  # Use dr_kms_key_arn if provided; otherwise fall back to the AWS-managed RDS key
-  # (alias/aws/rds) which always exists in every region at no extra cost.
-  kms_key_id                = var.dr_kms_key_arn != "" ? var.dr_kms_key_arn : null
-  skip_final_snapshot       = true
+  # Explicit KMS key in DR region — required by AWS for cross-region encrypted replicas
+  kms_key_id          = var.dr_kms_key_arn != "" ? var.dr_kms_key_arn : aws_kms_key.dr_aurora[0].arn
+  skip_final_snapshot = true
 
   lifecycle {
     ignore_changes = [engine_version]
