@@ -125,3 +125,9 @@ variable "db_node_instance_type" {
   type        = string
   default     = "t3.medium"
 }
+
+variable "region" {
+  description = "AWS region — used for auto kubeconfig update after cluster creation"
+  type        = string
+  default     = "us-east-1"
+}

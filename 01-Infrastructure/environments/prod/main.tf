@@ -50,6 +50,7 @@ module "eks" {
 
   project_name              = "pip-project-ecommerce"
   environment               = var.environment
+  region                    = var.primary_region
   cluster_version           = var.eks_cluster_version
   cluster_role_arn          = module.iam.cluster_role_arn
   node_role_arn             = module.iam.node_role_arn

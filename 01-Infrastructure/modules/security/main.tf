@@ -337,12 +337,47 @@ resource "aws_iam_role_policy" "vpc_flow_logs" {
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/flowlogs/${var.project_name}-${var.environment}"
   retention_in_days = 90
-  # KMS not used here — CloudWatch Logs encrypts with AES-256 by default.
-  # Custom KMS requires key policy propagation timing that causes apply failures.
 
   tags = {
     Name        = "${var.project_name}-vpc-flow-logs"
     Environment = var.environment
+  }
+
+  # Prevent failure if log group already exists from a previous apply
+  # CloudWatch log groups survive terraform destroy by design
+  lifecycle {
+    prevent_destroy       = false
+    create_before_destroy = false
+  }
+}
+
+resource "aws_cloudwatch_log_group" "app_logs" {
+  name              = "/aws/eks/${var.project_name}-${var.environment}/application"
+  retention_in_days = 30
+
+  tags = {
+    Name        = "${var.project_name}-app-logs"
+    Environment = var.environment
+  }
+
+  lifecycle {
+    prevent_destroy       = false
+    create_before_destroy = false
+  }
+}
+
+resource "aws_cloudwatch_log_group" "infra_logs" {
+  name              = "/aws/eks/${var.project_name}-${var.environment}/infrastructure"
+  retention_in_days = 90
+
+  tags = {
+    Name        = "${var.project_name}-infra-logs"
+    Environment = var.environment
+  }
+
+  lifecycle {
+    prevent_destroy       = false
+    create_before_destroy = false
   }
 }
 

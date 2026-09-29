@@ -301,3 +301,28 @@ resource "aws_eks_addon" "kube_proxy" {
 
 # NOTE: aws-ebs-csi-driver is applied in the eks-addons module
 # to avoid a circular dependency with the OIDC provider.
+
+# ==============================================
+# Auto-update kubeconfig after cluster is ready
+# ==============================================
+# WHY: The Helm provider uses ~/.kube/config. Without this, the
+# eks_addons module fails with "cluster unreachable" because
+# kubeconfig hasn't been updated yet after cluster creation.
+# This null_resource runs aws eks update-kubeconfig automatically
+# so the Helm provider can connect without any manual steps.
+# ==============================================
+resource "null_resource" "update_kubeconfig" {
+  triggers = {
+    cluster_name     = aws_eks_cluster.ecommerce.name
+    cluster_endpoint = aws_eks_cluster.ecommerce.endpoint
+  }
+
+  provisioner "local-exec" {
+    command = "aws eks update-kubeconfig --name ${aws_eks_cluster.ecommerce.name} --region ${var.region} --kubeconfig ~/.kube/config"
+  }
+
+  depends_on = [
+    aws_eks_node_group.workers,
+    aws_eks_node_group.public,
+  ]
+}
