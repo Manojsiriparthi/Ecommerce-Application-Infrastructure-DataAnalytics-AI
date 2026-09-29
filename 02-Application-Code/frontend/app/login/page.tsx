@@ -23,7 +23,7 @@ export default function Login() {
 
     try {
       const response = await fetch(
-        `${API.user}/api/users/login`,
+        `${API.user}/login`,
         {
           method: 'POST',
 

@@ -66,3 +66,9 @@ provider "kubernetes" {
   alias       = "dr"
   config_path = "~/.kube/config"
 }
+
+# ==============================================
+# Current account identity — used to build ECR registry URL
+# for the aurora db-setup local-exec
+# ==============================================
+data "aws_caller_identity" "current" {}

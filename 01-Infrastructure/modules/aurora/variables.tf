@@ -215,3 +215,27 @@ variable "dr_reader_count" {
 }
 
 
+
+# ==============================================
+# DB Setup (db-setup.tf) variables
+# ==============================================
+
+variable "account_id" {
+  description = "AWS account ID — used to build the ECR registry URL"
+  type        = string
+}
+
+variable "cluster_name" {
+  description = "EKS cluster name — kubectl connects here to run migration pods"
+  type        = string
+}
+
+variable "force_db_setup" {
+  description = <<-EOT
+    Set to any non-empty string to force db_setup to re-run on next terraform apply.
+    Example in prod.tfvars:  force_db_setup = "2026-09-27"
+    Leave empty for normal behaviour (only re-runs when proxy endpoint/password changes).
+  EOT
+  type    = string
+  default = ""
+}

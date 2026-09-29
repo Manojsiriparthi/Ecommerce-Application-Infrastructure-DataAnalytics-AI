@@ -33,7 +33,7 @@ export default function Cart() {
       setLoading(true);
       setError('');
 
-      const cartResponse = await apiFetch(`${API.cart}/api/cart`);
+      const cartResponse = await apiFetch(`${API.cart}`);
 
       const cartData = await cartResponse.json();
 
@@ -54,7 +54,7 @@ export default function Cart() {
        */
       try {
         const productResponse = await apiFetch(
-          `${API.product}/api/products`
+          `${API.product}`
         );
 
         if (productResponse.ok) {

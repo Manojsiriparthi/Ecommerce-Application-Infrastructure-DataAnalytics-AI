@@ -193,3 +193,14 @@ variable "enable_compute" {
   type        = bool
   default     = false
 }
+
+variable "force_db_setup" {
+  description = <<-EOT
+    Set to any non-empty string to force the aurora db_setup null_resource
+    to re-run on next terraform apply (creates DBs + runs prisma db push again).
+    Example: force_db_setup = "2026-09-27-run2"
+    Leave empty ("") for normal idempotent behaviour.
+  EOT
+  type    = string
+  default = ""
+}

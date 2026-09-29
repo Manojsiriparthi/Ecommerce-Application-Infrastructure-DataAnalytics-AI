@@ -158,6 +158,11 @@ module "aurora" {
   deletion_protection  = true
   sns_topic_arn        = module.messaging.sns_topic_arn
 
+  # DB setup (null_resource local-exec) — creates databases + tables after Aurora is ready
+  account_id     = data.aws_caller_identity.current.account_id
+  cluster_name   = module.eks.cluster_name
+  force_db_setup = var.force_db_setup
+
   enable_global_db = var.enable_global_db
   primary_region   = var.primary_region
   dr_region        = var.dr_region
@@ -166,7 +171,8 @@ module "aurora" {
   dr_db_subnet_group_name = module.networking_dr.db_subnet_group_name
   dr_aurora_sg_id         = module.networking_dr.aurora_sg_id
 
-  depends_on = [module.networking, module.security, module.messaging, module.networking_dr]
+  # Must wait for EKS + addons ready — migration pods need worker nodes
+  depends_on = [module.networking, module.security, module.messaging, module.networking_dr, module.eks_addons]
 }
 
 module "elasticache" {
