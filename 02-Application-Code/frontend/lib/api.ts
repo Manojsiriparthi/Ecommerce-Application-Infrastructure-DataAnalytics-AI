@@ -1,9 +1,29 @@
+// =============================================================================
+// API configuration — relative paths only
+// =============================================================================
+// WHY RELATIVE PATHS:
+//   Previously used NEXT_PUBLIC_*_API env vars with full URLs
+//   baked into the bundle at build time. This caused two problems:
+//     1. Docker image had to be rebuilt every time the internal ALB DNS changed
+//     2. Jenkins pipeline needed to know the internal ALB DNS before building
+//
+// THE FIX — Next.js rewrites in next.config.js:
+//   Browser calls: /api/users/register  (relative — no domain)
+//   Next.js server rewrites to: http://<internal-alb>/api/users/register
+//   INTERNAL_API_URL is set as a K8s env var from the ConfigMap at pod startup
+//
+// RESULT:
+//   - Same Docker image works in ALL environments
+//   - No build-time dependency on internal ALB DNS
+//   - Jenkins builds once, deploys anywhere
+// =============================================================================
+
 export const API = {
-  user: process.env.NEXT_PUBLIC_USER_API || 'http://localhost:4001',
-  product: process.env.NEXT_PUBLIC_PRODUCT_API || 'http://localhost:4002',
-  cart: process.env.NEXT_PUBLIC_CART_API || 'http://localhost:4003',
-  order: process.env.NEXT_PUBLIC_ORDER_API || 'http://localhost:4004',
-  payment: process.env.NEXT_PUBLIC_PAYMENT_API || 'http://localhost:4005',
+  user:    '/api/users',
+  product: '/api/products',
+  cart:    '/api/cart',
+  order:   '/api/orders',
+  payment: '/api/payments',
 };
 
 export function authHeaders(): Record<string, string> {
@@ -13,9 +33,7 @@ export function authHeaders(): Record<string, string> {
       : null;
 
   return token
-    ? {
-        Authorization: `Bearer ${token}`,
-      }
+    ? { Authorization: `Bearer ${token}` }
     : {};
 }
 
@@ -24,17 +42,12 @@ export async function apiFetch(
   init: RequestInit = {}
 ): Promise<Response> {
   const headers = new Headers(init.headers);
-
   headers.set('Content-Type', 'application/json');
 
   const auth = authHeaders();
-
   Object.entries(auth).forEach(([key, value]) => {
     headers.set(key, value);
   });
 
-  return fetch(url, {
-    ...init,
-    headers,
-  });
+  return fetch(url, { ...init, headers });
 }

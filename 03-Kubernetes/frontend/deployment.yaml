@@ -34,6 +34,15 @@ spec:
             configMapKeyRef:
               name: ecommerce-config
               key: aws_region
+        # INTERNAL_API_URL — read at pod startup from ConfigMap
+        # Next.js rewrites proxy /api/* to this URL server-side
+        # The browser never sees this URL — no build-time dependency
+        - name: INTERNAL_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: internal_alb_dns
+              optional: true   # Falls back to localhost if not set (dev/local)
         resources:
           requests:
             memory: "64Mi"

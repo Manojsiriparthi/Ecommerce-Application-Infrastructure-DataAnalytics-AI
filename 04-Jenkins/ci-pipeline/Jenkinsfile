@@ -77,6 +77,7 @@ pipeline {
         AWS_REGION     = 'ap-south-1'
         AWS_ACCOUNT_ID = '153099270680'          // Update to your account ID
         ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ENVIRONMENT    = 'prod'                   // Set to 'dev' for dev CI runs
 
         SONAR_HOST_URL = 'http://13.232.24.76:9000'
         SONAR_PROJECT  = 'ecommerce-application'
@@ -255,6 +256,10 @@ pipeline {
         // Images are built exactly ONCE here. The same image that passes
         // all tests below is pushed to ECR — no rebuild later.
         // Tags with IMAGE_TAG (ci-<BUILD_NUMBER>) now; re-tags to RELEASE_VERSION at push time.
+        //
+        // FRONTEND NOTE: NEXT_PUBLIC_* vars are baked into the bundle at build time.
+        // The internal ALB DNS is read from SSM and passed as --build-arg so the
+        // frontend knows where to call the backend services.
         // =====================================================================
         stage('Docker Build') {
             steps {
@@ -265,6 +270,11 @@ pipeline {
                         echo "🔐 ECR login..."
                         aws ecr get-login-password --region "${AWS_REGION}" | \
                             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+                        # Read internal ALB DNS from SSM — no longer needed as build arg
+                        # Frontend now uses Next.js rewrites (server-side proxy)
+                        # INTERNAL_API_URL is set at pod startup from ConfigMap
+                        # Same image works in ALL environments without rebuilding
 
                         while IFS= read -r SERVICE; do
                             SVC_NAME=$(basename "$SERVICE")

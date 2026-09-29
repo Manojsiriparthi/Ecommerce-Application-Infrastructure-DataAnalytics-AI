@@ -1,18 +1,12 @@
 # ==============================================
 # External ALB Ingress — internet-facing
-# Traffic path: Route53 → WAF WebACL → this ALB → frontend pods
+# Traffic path: Internet → WAF → this ALB → frontend pods
 #
-# ANNOTATIONS GUIDE:
-#  - scheme: internet-facing  → ALB in PUBLIC subnets, reachable from internet
-#  - wafv2-acl-arn            → attaches WAF WebACL (blocks OWASP top 10 + rate limit)
-#  - certificate-arn          → ACM cert for HTTPS termination at the ALB
-#  - ssl-redirect             → forces HTTP→HTTPS (port 80 redirects to 443)
-#  - listen-ports             → ALB listens on both 80 (redirect) and 443 (HTTPS)
-#  - target-type: ip          → routes directly to pod IPs (not node ports),
-#                               works because AWS VPC CNI assigns real VPC IPs to pods
-#  - access-log bucket        → ALB access logs → S3 (set via Terraform output)
-#  - group.name               → allows multiple Ingresses to share one ALB
-#                               (external-alb-group = this internet-facing ALB)
+# NO HOST RULES: Works with ALB DNS directly (no domain needed).
+# When domain is registered, add host rules and ACM cert annotation.
+#
+# SUBNET IDs: Patched automatically by 02-deploy-app.sh from AWS
+# PUBLIC_SUBNET tags. Do not hardcode here.
 # ==============================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -23,42 +17,19 @@ metadata:
     app: frontend
     tier: presentation
   annotations:
-    # ALB Controller
     kubernetes.io/ingress.class: alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 
-    # WAF — disabled until WAF ARN is stored in SSM after terraform apply
-    # To enable: uncomment and set the ARN from SSM:
-    #   aws ssm get-parameter --name /pip-project-ecommerce/prod/waf/web-acl-arn
-    # alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_WEBACL_ARN>"
-
-    # TLS — disabled until domain + ACM certificate are ready
-    # When domain is registered:
-    #   1. Run: terraform apply (creates Route53 + ACM cert)
-    #   2. Get cert ARN: aws ssm get-parameter --name /pip-project-ecommerce/prod/acm/certificate-arn
-    #   3. Uncomment and set the certificate-arn annotation below
-    #   4. Change listen-ports to include HTTPS
-    # alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN>"
+    # HTTP only — no TLS until domain + ACM cert are ready
+    # To add HTTPS after domain registration:
+    #   alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN from SSM>"
+    #   alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    #   alb.ingress.kubernetes.io/ssl-redirect: "443"
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
-    # alb.ingress.kubernetes.io/ssl-redirect: "443"
 
-    # ALB access logs disabled — S3 bucket policy needs ELB service account to be configured first
-    # Re-enable after running: terraform apply -target=module.waf
-    alb.ingress.kubernetes.io/load-balancer-attributes: >-
-      idle_timeout.timeout_seconds=60,
-      routing.http2.enabled=true,
-      deletion_protection.enabled=false
-
-    # Target group stickiness — rubric requirement
-    # Keeps the same user on the same pod for session consistency
-    # Duration: 1 day (86400 seconds)
-    alb.ingress.kubernetes.io/target-group-attributes: >-
-      stickiness.enabled=true,
-      stickiness.lb_cookie.duration_seconds=86400,
-      stickiness.type=lb_cookie,
-      deregistration_delay.timeout_seconds=30,
-      slow_start.duration_seconds=30
+    # WAF — attach after domain + cert are configured
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_ARN from SSM>"
 
     # Health check
     alb.ingress.kubernetes.io/healthcheck-path: /
@@ -66,32 +37,37 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
     alb.ingress.kubernetes.io/success-codes: "200"
 
-    # Group — multiple Ingress objects share this single external ALB
+    # Group — shares one ALB
     alb.ingress.kubernetes.io/group.name: external-alb-group
     alb.ingress.kubernetes.io/group.order: "10"
 
-    # Subnets — public subnets (comma-separated subnet IDs from Terraform)
-    # Replace with actual IDs from terraform output module.networking.public_subnet_ids
+    # Subnets — replaced by deploy script with real subnet IDs
     alb.ingress.kubernetes.io/subnets: "<PUBLIC_SUBNET_ID_1>,<PUBLIC_SUBNET_ID_2>,<PUBLIC_SUBNET_ID_3>"
 
-    # Tags applied to the ALB resource in AWS
+    # ALB attributes
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      idle_timeout.timeout_seconds=60,
+      routing.http2.enabled=true,
+      deletion_protection.enabled=false
+
+    # Stickiness
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      stickiness.enabled=true,
+      stickiness.lb_cookie.duration_seconds=86400,
+      stickiness.type=lb_cookie,
+      deregistration_delay.timeout_seconds=30
+
     alb.ingress.kubernetes.io/tags: "Environment=prod,Project=pip-project-ecommerce,ManagedBy=terraform"
+
 spec:
   ingressClassName: alb
+  # No host rules — works with ALB DNS directly
+  # Add host rules when domain is registered:
+  #   rules:
+  #   - host: ecommerce-pip.com
+  #     http: ...
   rules:
-  # Replace yourdomain.com with your actual domain
-  - host: yourdomain.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: frontend-service
-            port:
-              number: 80
-  - host: www.yourdomain.com
-    http:
+  - http:
       paths:
       - path: /
         pathType: Prefix

@@ -32,9 +32,8 @@ module "security" {
   ses_from_email       = var.ses_from_email
   vpc_id               = module.networking.vpc_id
   create_flow_logs     = true
-  db_proxy_endpoint    = module.aurora.proxy_endpoint
 
-  depends_on = [module.networking, module.aurora]
+  depends_on = [module.networking]
 }
 
 module "iam" {

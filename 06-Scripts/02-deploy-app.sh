@@ -285,14 +285,14 @@ if [[ "$ACTION" == "deploy" ]]; then
   [[ -n "$EXT_ALB" ]] && success "External ALB: $EXT_ALB"
   [[ -n "$INT_ALB" ]] && success "Internal ALB: $INT_ALB"
 
-  # Update ConfigMap with real internal ALB
+  # Update ConfigMap with real internal ALB — with http:// prefix for Next.js rewrites
   if [[ -n "$INT_ALB" ]]; then
     kubectl create configmap ecommerce-config --namespace ecommerce \
       --from-literal=aws_region="$REGION" \
       --from-literal=redis_host="${REDIS_HOST:-placeholder}" \
       --from-literal=redis_port="6379" \
       --from-literal=sns_topic_arn="${SNS_TOPIC:-placeholder}" \
-      --from-literal=internal_alb_dns="$INT_ALB" \
+      --from-literal=internal_alb_dns="http://$INT_ALB" \
       --from-literal=ses_from_email="$SES_EMAIL" \
       --dry-run=client -o yaml | kubectl apply -f -
 
