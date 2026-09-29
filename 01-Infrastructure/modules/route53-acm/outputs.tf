@@ -1,6 +1,6 @@
 output "certificate_arn" {
-  description = "Validated ACM certificate ARN. Empty string when domain_name is not set."
-  value       = length(aws_acm_certificate_validation.ecommerce) > 0 ? aws_acm_certificate_validation.ecommerce[0].certificate_arn : ""
+  description = "ACM certificate ARN — available immediately, validates automatically after DNS propagates"
+  value       = length(aws_acm_certificate.ecommerce) > 0 ? aws_acm_certificate.ecommerce[0].arn : ""
 }
 
 output "hosted_zone_id" {

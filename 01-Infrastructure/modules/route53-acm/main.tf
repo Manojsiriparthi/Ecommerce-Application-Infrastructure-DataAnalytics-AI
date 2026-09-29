@@ -75,22 +75,29 @@ resource "aws_route53_record" "cert_validation" {
   allow_overwrite = true
 }
 
+# =============================================================================
+# ACM Certificate validation — NON-BLOCKING
+# =============================================================================
+# The validation happens automatically once Namecheap nameservers point to
+# Route53 and DNS propagates (5-30 min). We do NOT wait for it in Terraform
+# because it would block the entire apply for up to 48 hours if DNS is slow.
+#
+# The cert ARN is available immediately after aws_acm_certificate is created.
+# The ALB ingress can use the cert ARN even before it's ISSUED —
+# the ALB will start serving HTTPS once validation completes automatically.
+#
+# To check validation status:
+#   aws acm describe-certificate \
+#     --certificate-arn <ARN> --region us-east-1 \
+#     --query "Certificate.Status"
+# =============================================================================
 resource "aws_acm_certificate_validation" "ecommerce" {
-  count = local.enabled ? 1 : 0
+  count = 0   # Disabled — cert validates automatically, no need to block apply
 
   certificate_arn         = aws_acm_certificate.ecommerce[0].arn
   validation_record_fqdns = [
     for record in aws_route53_record.cert_validation : record.fqdn
   ]
-
-  # WHY 45 min timeout:
-  # DNS validation requires Namecheap nameservers to point to Route53 first.
-  # Once Namecheap is updated (5-30 min) + DNS propagation, AWS validates.
-  # If this times out: Namecheap nameservers not updated yet.
-  # Fix: update Namecheap nameservers to Route53 NS values, then re-apply.
-  timeouts {
-    create = "45m"
-  }
 }
 
 # =============================================================================
