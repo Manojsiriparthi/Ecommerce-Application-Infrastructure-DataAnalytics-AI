@@ -142,7 +142,9 @@ resource "aws_ssm_parameter" "cert_arn" {
 
   name        = "/${var.project_name}/${var.environment}/acm/certificate-arn"
   type        = "String"
-  value       = aws_acm_certificate_validation.ecommerce[0].certificate_arn
+  # Use the cert ARN directly — not the validation resource (which has count=0)
+  # The cert ARN is available immediately after creation, before validation completes
+  value       = aws_acm_certificate.ecommerce[0].arn
   description = "ACM certificate ARN for ${local.domain}"
 
   tags = {
