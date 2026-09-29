@@ -76,10 +76,10 @@ resource "aws_eks_node_group" "workers" {
 }
 
 resource "aws_launch_template" "workers" {
-  name_prefix   = "${var.project_name}-workers-"
-  instance_type = var.worker_instance_type
+  name_prefix = "${var.project_name}-workers-"
+  # instance_type is NOT set here — set in node group instance_types instead
+  # Setting it in both causes: "Cannot specify instance types in launch template and API request"
 
-  # Name tag on each EC2 instance created by the node group
   tag_specifications {
     resource_type = "instance"
     tags = {
@@ -100,8 +100,8 @@ resource "aws_launch_template" "workers" {
 
   metadata_options {
     http_endpoint               = "enabled"
-    http_tokens                 = "required"  # IMDSv2 required
-    http_put_response_hop_limit = 2           # 2 needed for containers inside pods
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
   }
 
   tags = {
@@ -168,8 +168,8 @@ resource "aws_eks_node_group" "public" {
 }
 
 resource "aws_launch_template" "public" {
-  name_prefix   = "${var.project_name}-public-"
-  instance_type = var.public_node_instance_type
+  name_prefix = "${var.project_name}-public-"
+  # instance_type NOT set here — controlled by node group instance_types
 
   tag_specifications {
     resource_type = "instance"

@@ -7,9 +7,6 @@
 **Infrastructure as Code:** Terraform  
 **Container Orchestration:** Kubernetes (Amazon EKS)
 
----
-
-![alt text](image.png)
 
 ## Table of Contents
 
