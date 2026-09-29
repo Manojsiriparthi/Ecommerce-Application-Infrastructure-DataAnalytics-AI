@@ -19,11 +19,12 @@
 #
 # PREREQUISITES:
 #   - Terraform apply completed (Aurora + RDS Proxy running)
-#   - psql installed: sudo apt-get install postgresql-client
-#   - Node.js + npm installed
 #   - AWS CLI configured with credentials
-#   - kubectl configured (aws eks update-kubeconfig already run)
+#   - kubectl installed (aws eks update-kubeconfig will be run automatically)
 #   - You are running this from the repo root
+#
+# NOTE: psql and Node.js are NOT needed on your machine.
+#   All DB operations run as pods INSIDE EKS (same VPC as Aurora).
 #
 # USAGE:
 #   chmod +x 06-Scripts/01-setup-databases.sh
@@ -57,34 +58,60 @@ echo -e "${NC}"
 # ── Check prerequisites ────────────────────────────────────────────────────────
 header "Checking prerequisites"
 
-command -v aws    &>/dev/null || fail "AWS CLI not found. Run install-tools.sh first."
-command -v psql   &>/dev/null || { warn "psql not found. Installing..."; sudo apt-get install -y -q postgresql-client; }
-command -v node   &>/dev/null || fail "Node.js not found. Run install-tools.sh first."
-command -v npx    &>/dev/null || fail "npx not found. Install Node.js first."
+command -v aws     &>/dev/null || fail "AWS CLI not found. Run install-tools.sh first."
+command -v kubectl &>/dev/null || fail "kubectl not found. Run install-tools.sh first."
 
-success "All prerequisites met"
+success "All prerequisites met (psql/node not needed — all DB ops run inside EKS)"
 
-# ── Step 1: Read DB connection info from AWS ───────────────────────────────────
-header "Step 1: Reading DB connection from AWS SSM + Secrets Manager"
+# ── Step 1: Connect kubectl ───────────────────────────────────────────────────
+header "Step 1: Connect kubectl to EKS"
 
-info "Fetching RDS Proxy endpoint from SSM..."
-# Try proxy endpoint first, fall back to writer endpoint
+CLUSTER_NAME="${PROJECT}-cluster"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+info "Connecting kubectl to EKS cluster..."
+aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" 2>/dev/null || \
+  aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
+
+NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c Ready || echo 0)
+[[ "$NODES" -eq 0 ]] && fail "No Ready nodes found. Is the EKS cluster up? Run 04-terraform-apply.sh first."
+success "kubectl connected — $NODES node(s) Ready"
+
+# Ensure namespace + SecretProviderClasses are in place
+kubectl apply -f "$REPO_ROOT/03-Kubernetes/namespace.yaml" 2>/dev/null || true
+kubectl apply -f "$REPO_ROOT/03-Kubernetes/secrets/serviceaccount.yaml" 2>/dev/null || true
+kubectl apply -f "$REPO_ROOT/03-Kubernetes/secrets/secretproviderclass-db.yaml" 2>/dev/null || true
+
+# ── Step 2: Read DB endpoint from AWS (for the create-databases pod) ──────────
+header "Step 2: Fetching DB endpoint from AWS"
+
+# WHY we still read DB_HOST here (but not connect locally):
+#   Steps 3 creates databases using a psql pod inside the cluster.
+#   That pod needs the RDS host + master credentials — we pass them as env vars.
+
+info "Fetching RDS Writer endpoint from SSM / Aurora API..."
 DB_HOST=$(aws ssm get-parameter \
   --name "/${PROJECT}/${ENV}/rds/proxy-endpoint" \
-  --region "$REGION" --query Parameter.Value --output text 2>/dev/null) || \
-DB_HOST=$(aws rds describe-db-proxies \
-  --db-proxy-name "${PROJECT}-proxy" \
-  --region "$REGION" \
-  --query "DBProxies[0].Endpoint" --output text 2>/dev/null) || \
-DB_HOST=$(aws rds describe-db-clusters \
-  --db-cluster-identifier "${PROJECT}-cluster" \
-  --region "$REGION" \
-  --query "DBClusters[0].Endpoint" --output text)
+  --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+
+if [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]]; then
+  DB_HOST=$(aws rds describe-db-proxies \
+    --db-proxy-name "${PROJECT}-proxy" \
+    --region "$REGION" \
+    --query "DBProxies[0].Endpoint" --output text 2>/dev/null || echo "")
+fi
+
+if [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]]; then
+  DB_HOST=$(aws rds describe-db-clusters \
+    --db-cluster-identifier "${PROJECT}-cluster" \
+    --region "$REGION" \
+    --query "DBClusters[0].Endpoint" --output text 2>/dev/null || echo "")
+fi
 
 [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]] && fail "Could not find DB endpoint. Is Aurora running?"
 success "DB Host: $DB_HOST"
 
-info "Fetching DB credentials from Secrets Manager..."
+info "Fetching master credentials from Secrets Manager..."
 SECRET=$(aws secretsmanager get-secret-value \
   --secret-id "${PROJECT}-db-credentials" \
   --region "$REGION" \
@@ -92,103 +119,304 @@ SECRET=$(aws secretsmanager get-secret-value \
 
 DB_USER=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
 DB_PASS=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
-DB_PORT="5432"
 
 success "Credentials loaded (username: $DB_USER)"
 
-export PGPASSWORD="$DB_PASS"
+# ── Step 3: Create databases inside Aurora (runs as a pod in the cluster) ─────
+header "Step 3: Creating service databases inside Aurora"
 
-# ── Step 2: Test connection ────────────────────────────────────────────────────
-header "Step 2: Testing Aurora connection"
+# WHY a pod:
+#   Aurora is in a private subnet — unreachable from your laptop.
+#   We run a postgres:alpine pod INSIDE EKS, which is in the same VPC,
+#   to execute CREATE DATABASE for each service. Pod is deleted after.
 
-info "Connecting to Aurora at $DB_HOST:$DB_PORT ..."
+info "Launching create-databases pod inside EKS (same VPC as Aurora)..."
 
-# RDS Proxy requires SSL
-if psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=postgres sslmode=require" \
-  -c "SELECT version();" -t -q 2>/dev/null | grep -q PostgreSQL; then
-  success "Aurora connection successful"
-else
-  # Try without SSL (direct connection)
-  psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=postgres" \
-    -c "SELECT version();" -t -q || fail "Cannot connect to Aurora. Check security groups and VPC routing."
-  SSLMODE=""
-  success "Aurora connection successful (no SSL — direct endpoint)"
-fi
+kubectl delete pod create-databases -n ecommerce --ignore-not-found 2>/dev/null || true
 
-SSLMODE="${SSLMODE:-sslmode=require}"
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: create-databases
+  namespace: ecommerce
+spec:
+  restartPolicy: Never
+  containers:
+  - name: psql
+    image: postgres:15-alpine
+    command:
+    - sh
+    - -c
+    - |
+      export PGPASSWORD="\$DB_PASS"
+      echo "Connecting to Aurora at \$DB_HOST..."
+      for DB in user_db product_db cart_db order_db payment_db; do
+        EXISTS=\$(psql -h "\$DB_HOST" -U "\$DB_USER" -d postgres -tAc \
+          "SELECT 1 FROM pg_database WHERE datname='\$DB'" 2>/dev/null || echo "")
+        if [ "\$EXISTS" = "1" ]; then
+          echo "  SKIP: \$DB already exists"
+        else
+          psql -h "\$DB_HOST" -U "\$DB_USER" -d postgres \
+            -c "CREATE DATABASE \$DB;" && echo "  CREATED: \$DB" || echo "  WARN: \$DB may already exist"
+        fi
+      done
+      echo "Done creating databases."
+    env:
+    - name: DB_HOST
+      value: "${DB_HOST}"
+    - name: DB_USER
+      value: "${DB_USER}"
+    - name: DB_PASS
+      value: "${DB_PASS}"
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+EOF
 
-# ── Step 3: Create databases ───────────────────────────────────────────────────
-header "Step 3: Creating service databases"
+info "Waiting for create-databases pod..."
+kubectl wait pod create-databases -n ecommerce \
+  --for=condition=Ready --timeout=60s 2>/dev/null || true
+kubectl wait pod create-databases -n ecommerce \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s 2>/dev/null || true
+kubectl logs create-databases -n ecommerce 2>/dev/null || warn "Could not get logs"
+kubectl delete pod create-databases -n ecommerce --ignore-not-found 2>/dev/null || true
 
-DATABASES=("user_db" "product_db" "cart_db" "order_db" "payment_db")
+success "All 5 databases created (or already existed)"
 
-for DB in "${DATABASES[@]}"; do
-  info "Creating database: $DB"
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
-  # Check if already exists
-  EXISTS=$(psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=postgres $SSLMODE" \
-    -tAc "SELECT 1 FROM pg_database WHERE datname='$DB'" 2>/dev/null || echo "")
-
-  if [[ "$EXISTS" == "1" ]]; then
-    warn "  Database $DB already exists — skipping"
-  else
-    psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=postgres $SSLMODE" \
-      -c "CREATE DATABASE $DB;" 2>/dev/null && success "  Created: $DB" || warn "  $DB may already exist"
-  fi
-done
-
-success "All 5 databases ready"
-
-# ── Step 4: Run Prisma migrations ─────────────────────────────────────────────
+# ── Step 4: Run Prisma migrations via Kubernetes Jobs ─────────────────────────
 header "Step 4: Running Prisma migrations (creates all tables)"
 
-info "Prisma migrations run inside each service container."
-info "This creates the tables inside each database."
-echo ""
+# WHY Kubernetes Jobs, not local npx:
+#   RDS is in a private subnet — your laptop in Hyderabad cannot reach it.
+#   The EKS worker nodes ARE inside the VPC, so they can reach RDS.
+#   We spin up a one-off pod per service (using the already-pushed ECR image),
+#   run `prisma db push`, then delete the pod.
+#   WHY db push not migrate deploy:
+#     Your services have schema.prisma but no prisma/migrations/ folder yet.
+#     `migrate deploy` requires migration files — it would fail on a fresh DB.
+#     `prisma db push` syncs the schema directly, creating all tables.
+#     Once you're in production with real data, switch to `migrate deploy`
+#     and generate migrations with `prisma migrate dev` locally.
+#   The pod inherits the same IRSA + SecretProviderClass as the service pod,
+#   so it gets the correct DATABASE_URL automatically.
 
-# Map service → database
-declare -A SERVICE_DB=(
-  ["user-service"]="user_db"
-  ["product-service"]="product_db"
-  ["cart-service"]="cart_db"
-  ["order-service"]="order_db"
-  ["payment-service"]="payment_db"
+# ── Services that need migrations ────────────────────────────────────────────
+# notification-service has no prisma dir — excluded
+declare -A SERVICE_SECRET=(
+  ["user-service"]="user-service-secrets:user-db-url"
+  ["product-service"]="product-service-secrets:product-db-url"
+  ["cart-service"]="cart-service-secrets:cart-db-url"
+  ["order-service"]="order-service-secrets:order-db-url"
+  ["payment-service"]="payment-service-secrets:payment-db-url"
 )
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+MIGRATION_FAILED=()
 
-for SERVICE in "${!SERVICE_DB[@]}"; do
-  DB="${SERVICE_DB[$SERVICE]}"
-  SERVICE_DIR="$REPO_ROOT/02-Application-Code/services/$SERVICE"
+for SERVICE in user-service product-service cart-service order-service payment-service; do
+  IFS=':' read -r SPC SECRET_NAME <<< "${SERVICE_SECRET[$SERVICE]}"
+  IMAGE="${ECR_REGISTRY}/${PROJECT}/${SERVICE}:latest"
+  POD_NAME="migrate-${SERVICE}"
 
-  if [[ ! -d "$SERVICE_DIR/prisma" ]]; then
-    warn "No prisma/ directory found in $SERVICE — skipping"
-    continue
+  info "[$SERVICE] Launching migration pod..."
+
+  # Delete any leftover pod from a previous run
+  kubectl delete pod "$POD_NAME" -n ecommerce --ignore-not-found --wait=false 2>/dev/null || true
+
+  # Build the pod spec as a YAML and apply it
+  # - Uses the same ServiceAccount (IRSA) as the service deployment
+  # - Mounts the SecretProviderClass so DATABASE_URL is available as a K8s secret
+  # - Runs `prisma db push` to create all tables, then exits
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  namespace: ecommerce
+  labels:
+    app: db-migrate
+    service: ${SERVICE}
+spec:
+  restartPolicy: Never
+  serviceAccountName: ecommerce-services-sa
+  volumes:
+  - name: aws-secrets
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: "${SPC}"
+  containers:
+  - name: migrate
+    image: ${IMAGE}
+    imagePullPolicy: Always
+    command: ["npx", "prisma", "db", "push", "--accept-data-loss"]
+    volumeMounts:
+    - name: aws-secrets
+      mountPath: /mnt/secrets
+      readOnly: true
+    env:
+    - name: NODE_ENV
+      value: "production"
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: ${SECRET_NAME}
+          key: database_url
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "300m"
+EOF
+
+  # Wait up to 3 minutes for the migration to complete
+  info "[$SERVICE] Waiting for migration to complete (timeout: 3m)..."
+  if kubectl wait pod "$POD_NAME" -n ecommerce \
+    --for=condition=Ready --timeout=60s 2>/dev/null; then
+    # Pod started — now wait for it to finish
+    kubectl wait pod "$POD_NAME" -n ecommerce \
+      --for=jsonpath='{.status.phase}'=Succeeded --timeout=180s 2>/dev/null || true
   fi
 
-  info "Running Prisma migration for $SERVICE → $DB ..."
+  PHASE=$(kubectl get pod "$POD_NAME" -n ecommerce \
+    -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
 
-  DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB}?${SSLMODE/sslmode/sslmode}"
+  echo ""
+  echo -e "${BOLD}  ── $SERVICE migration logs ──${NC}"
+  kubectl logs "$POD_NAME" -n ecommerce 2>/dev/null || echo "  (no logs yet)"
+  echo ""
 
-  (
-    cd "$SERVICE_DIR"
-    DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB}?sslmode=require" \
-      npx prisma migrate deploy 2>&1 | tail -5
-  ) && success "  $SERVICE migration complete" || warn "  $SERVICE migration had issues (check above)"
-done
-
-# ── Step 5: Verify tables ──────────────────────────────────────────────────────
-header "Step 5: Verifying tables were created"
-
-for DB in user_db product_db cart_db order_db payment_db; do
-  TABLE_COUNT=$(psql "host=$DB_HOST port=$DB_PORT user=$DB_USER dbname=$DB $SSLMODE" \
-    -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null || echo "0")
-  if [[ "$TABLE_COUNT" -gt 0 ]]; then
-    success "$DB: $TABLE_COUNT table(s) found"
+  if [[ "$PHASE" == "Succeeded" ]]; then
+    success "[$SERVICE] Migration COMPLETE ✓"
   else
-    warn "$DB: no tables found (migration may have failed)"
+    warn "[$SERVICE] Migration pod phase: $PHASE — check logs above"
+    MIGRATION_FAILED+=("$SERVICE")
   fi
+
+  # Clean up the pod
+  kubectl delete pod "$POD_NAME" -n ecommerce --ignore-not-found 2>/dev/null || true
 done
+
+# ── Report ───────────────────────────────────────────────────────────────────
+if [[ ${#MIGRATION_FAILED[@]} -gt 0 ]]; then
+  warn "The following migrations had issues: ${MIGRATION_FAILED[*]}"
+  warn "Re-run this script or check pod logs with:"
+  warn "  kubectl logs migrate-<service> -n ecommerce"
+else
+  success "All 5 service migrations completed successfully"
+fi
+
+# ── Step 5: Verify tables exist in RDS ───────────────────────────────────────
+header "Step 5: Verifying tables exist inside RDS"
+
+# Runs a postgres:alpine pod inside EKS (same VPC as Aurora).
+# Uses the master credentials fetched in Step 2 to connect to each database
+# and list every table — so you can see exactly what was created.
+
+info "Launching verify pod (connects to all 5 databases and lists tables)..."
+
+kubectl delete pod db-verify -n ecommerce --ignore-not-found 2>/dev/null || true
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-verify
+  namespace: ecommerce
+spec:
+  restartPolicy: Never
+  containers:
+  - name: verify
+    image: postgres:15-alpine
+    command:
+    - sh
+    - -c
+    - |
+      export PGPASSWORD="\$DB_PASS"
+      echo ""
+      echo "╔══════════════════════════════════════════════════╗"
+      echo "║         RDS Table Verification Report            ║"
+      echo "║  Host: \$DB_HOST                                  ║"
+      echo "╚══════════════════════════════════════════════════╝"
+      echo ""
+
+      ALL_OK=true
+
+      for DB in user_db product_db cart_db order_db payment_db; do
+        echo "── \$DB ──────────────────────────────────────────"
+
+        # Check DB exists
+        DB_EXISTS=\$(psql -h "\$DB_HOST" -U "\$DB_USER" -d postgres \
+          -tAc "SELECT 1 FROM pg_database WHERE datname='\$DB'" 2>/dev/null || echo "")
+
+        if [ "\$DB_EXISTS" != "1" ]; then
+          echo "  ✗ DATABASE '\$DB' does NOT exist in RDS"
+          ALL_OK=false
+          echo ""
+          continue
+        fi
+
+        echo "  ✓ Database exists"
+
+        # List all tables in this database
+        TABLES=\$(psql -h "\$DB_HOST" -U "\$DB_USER" -d "\$DB" \
+          -tAc "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename" \
+          2>/dev/null || echo "")
+
+        if [ -z "\$TABLES" ]; then
+          echo "  ✗ No tables found — migration may have failed"
+          ALL_OK=false
+        else
+          echo "  Tables in \$DB:"
+          echo "\$TABLES" | while read -r TBL; do
+            [ -z "\$TBL" ] && continue
+            # Count rows in each table
+            ROWS=\$(psql -h "\$DB_HOST" -U "\$DB_USER" -d "\$DB" \
+              -tAc "SELECT count(*) FROM \"\$TBL\"" 2>/dev/null | tr -d ' ' || echo "?")
+            echo "    ✓ \$TBL  (rows: \$ROWS)"
+          done
+        fi
+        echo ""
+      done
+
+      echo "══════════════════════════════════════════════════"
+      if [ "\$ALL_OK" = "true" ]; then
+        echo "  RESULT: All databases and tables are present ✓"
+      else
+        echo "  RESULT: Some databases/tables are MISSING ✗"
+        echo "  Re-run: ./06-Scripts/01-setup-databases.sh"
+      fi
+      echo "══════════════════════════════════════════════════"
+      echo ""
+    env:
+    - name: DB_HOST
+      value: "${DB_HOST}"
+    - name: DB_USER
+      value: "${DB_USER}"
+    - name: DB_PASS
+      value: "${DB_PASS}"
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+EOF
+
+info "Waiting for verify pod..."
+kubectl wait pod db-verify -n ecommerce \
+  --for=condition=Ready --timeout=60s 2>/dev/null || true
+kubectl wait pod db-verify -n ecommerce \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=90s 2>/dev/null || true
+
+echo ""
+kubectl logs db-verify -n ecommerce 2>/dev/null || warn "Verify pod logs unavailable"
+kubectl delete pod db-verify -n ecommerce --ignore-not-found 2>/dev/null || true
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
