@@ -7,6 +7,8 @@ metadata:
     app: order-service
     tier: backend
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -110,4 +112,5 @@ spec:
                   operator: In
                   values: [order-service]
               topologyKey: kubernetes.io/hostname
+
 

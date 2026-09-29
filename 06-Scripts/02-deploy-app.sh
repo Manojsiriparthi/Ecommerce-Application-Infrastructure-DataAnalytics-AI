@@ -229,18 +229,34 @@ if [[ "$ACTION" == "deploy" ]]; then
   kubectl apply -f "$K8S/secrets/serviceaccount.yaml"
   kubectl apply -f "$K8S/secrets/secretproviderclass-db.yaml"
 
-  # ConfigMap with real values
+  # Check if ConfigMap already exists with a real internal ALB DNS
+  # (re-deploy scenario — don't clobber a working value with "pending")
+  EXISTING_INT_ALB=$(kubectl get configmap ecommerce-config \
+    -n ecommerce -o jsonpath='{.data.internal_alb_dns}' 2>/dev/null || echo "")
+
+  if [[ -n "$EXISTING_INT_ALB" && "$EXISTING_INT_ALB" != "pending" ]]; then
+    INT_ALB_INIT="$EXISTING_INT_ALB"
+    info "Re-deploy: keeping existing internal_alb_dns=$INT_ALB_INIT"
+  else
+    # First deploy — set to "pending"; Phase 7 will update it once the ALB is ready
+    INT_ALB_INIT="pending"
+    info "First deploy: internal_alb_dns will be updated in Phase 7 once the ALB is provisioned"
+  fi
+
+  # ConfigMap — backend services need aws_region, redis, sns immediately
+  # Frontend needs internal_alb_dns but that won't be valid until after ingress is provisioned
+  # We deploy frontend LAST (after ALBs), so by then ConfigMap will have the real value
   kubectl create configmap ecommerce-config \
     --namespace ecommerce \
     --from-literal=aws_region="$REGION" \
     --from-literal=redis_host="${REDIS_HOST:-placeholder}" \
     --from-literal=redis_port="6379" \
     --from-literal=sns_topic_arn="${SNS_TOPIC:-placeholder}" \
-    --from-literal=internal_alb_dns="pending" \
+    --from-literal=internal_alb_dns="$INT_ALB_INIT" \
     --from-literal=ses_from_email="$SES_EMAIL" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-  # Backend services
+  # ── Deploy backend services FIRST (no dependency on internal ALB) ────────
   for SVC in user-service product-service cart-service \
              order-service payment-service notification-service; do
     kubectl apply -f "$K8S/services/$SVC/service.yaml"
@@ -248,45 +264,58 @@ if [[ "$ACTION" == "deploy" ]]; then
   done
   kubectl apply -f "$K8S/services/ingress-internal.yaml"
 
-  # Frontend
+  # ── Do NOT deploy frontend yet — wait for internal ALB first (Phase 6b) ──
+  # Frontend pod reads INTERNAL_API_URL from ConfigMap at startup.
+  # We need the real ALB DNS in ConfigMap BEFORE the frontend pod starts.
   kubectl apply -f "$K8S/frontend/service.yaml"
-  kubectl apply -f "$K8S/frontend/deployment.yaml"
-  kubectl apply -f "$K8S/frontend/hpa.yaml" 2>/dev/null || true
-  kubectl apply -f "$K8S/frontend/ingress.yaml"
+  kubectl apply -f "$K8S/frontend/ingress.yaml"  # external ALB can start provisioning
 
-  success "All manifests applied"
+  success "Backend manifests applied — waiting for internal ALB before starting frontend"
 
-  # ── Phase 6: Wait for pods ───────────────────────────────────────────────
-  header "Phase 6: Wait for pods"
+  # ── Phase 6: Wait for backend pods ──────────────────────────────────────
+  header "Phase 6: Wait for backend pods"
   for DEPLOY in user-service-deployment product-service-deployment \
                 cart-service-deployment order-service-deployment \
-                payment-service-deployment notification-service-deployment \
-                frontend-deployment; do
+                payment-service-deployment notification-service-deployment; do
     kubectl rollout status deployment/"$DEPLOY" \
       --namespace ecommerce --timeout=300s \
       && success "  $DEPLOY Ready" \
       || warn "  $DEPLOY timeout — check: kubectl describe deployment $DEPLOY -n ecommerce"
   done
 
-  # ── Phase 7: Wait for ALBs ───────────────────────────────────────────────
+  # ── Phase 7: Wait for ALBs, then deploy frontend ─────────────────────────
   header "Phase 7: Wait for ALBs"
+  # WHY wait here:
+  #   The frontend pod reads INTERNAL_API_URL from ConfigMap at startup.
+  #   If we start the pod before the internal ALB DNS is available, INTERNAL_API_URL
+  #   would be "pending" and all backend API calls would fail.
+  #   We wait until the internal ALB hostname is assigned, update the ConfigMap,
+  #   THEN start the frontend pod so it picks up the correct value on first boot.
   wait_alb() {
-    local NAME="$1" DNS=""
-    for i in $(seq 1 30); do
+    local NAME="$1" DNS="" MAX=40
+    info "  Waiting for ingress/$NAME to get an ALB hostname (max ~$(( MAX * 15 ))s)..."
+    for i in $(seq 1 $MAX); do
       DNS=$(kubectl get ingress "$NAME" -n ecommerce \
         -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-      [[ -n "$DNS" ]] && { echo "$DNS"; return; }
-      echo -n "."; sleep 10
-    done; echo ""
+      [[ -n "$DNS" ]] && { echo "$DNS"; return 0; }
+      echo -n "  [$i/$MAX] waiting..."; sleep 15; echo ""
+    done
+    echo ""
+    return 1
   }
 
-  EXT_ALB=$(wait_alb "frontend-external-ingress")
-  INT_ALB=$(wait_alb "services-internal-ingress")
-  [[ -n "$EXT_ALB" ]] && success "External ALB: $EXT_ALB"
-  [[ -n "$INT_ALB" ]] && success "Internal ALB: $INT_ALB"
+  EXT_ALB=$(wait_alb "frontend-external-ingress") || warn "External ALB not ready after timeout"
+  INT_ALB=$(wait_alb "services-internal-ingress")  || warn "Internal ALB not ready after timeout"
 
-  # Update ConfigMap with real internal ALB — with http:// prefix for Next.js rewrites
+  [[ -n "$EXT_ALB" ]] && success "External ALB: $EXT_ALB" || true
+  [[ -n "$INT_ALB" ]] && success "Internal ALB: $INT_ALB" || true
+
+  # ── Update ConfigMap with real internal ALB ──────────────────────────────
+  # CRITICAL: Must happen BEFORE the frontend pod starts.
+  # The frontend reads INTERNAL_API_URL from this ConfigMap at pod startup.
+  # Next.js rewrites proxy /api/* → INTERNAL_API_URL server-side.
   if [[ -n "$INT_ALB" ]]; then
+    info "Updating ConfigMap internal_alb_dns → http://$INT_ALB"
     kubectl create configmap ecommerce-config --namespace ecommerce \
       --from-literal=aws_region="$REGION" \
       --from-literal=redis_host="${REDIS_HOST:-placeholder}" \
@@ -295,12 +324,49 @@ if [[ "$ACTION" == "deploy" ]]; then
       --from-literal=internal_alb_dns="http://$INT_ALB" \
       --from-literal=ses_from_email="$SES_EMAIL" \
       --dry-run=client -o yaml | kubectl apply -f -
+    success "ConfigMap updated with real internal ALB"
 
+    # Persist to SSM so future re-deploys can skip the wait
     aws ssm put-parameter \
       --name "/${PROJECT}/${ENV}/alb/internal-dns" \
       --value "$INT_ALB" --type String --overwrite \
-      --region "$REGION" 2>/dev/null || true
+      --region "$REGION" 2>/dev/null && \
+      info "  Saved to SSM: /${PROJECT}/${ENV}/alb/internal-dns" || true
+  else
+    # Internal ALB timed out — check SSM for a previously saved value
+    SAVED_INT_ALB=$(aws ssm get-parameter \
+      --name "/${PROJECT}/${ENV}/alb/internal-dns" \
+      --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+
+    if [[ -n "$SAVED_INT_ALB" && "$SAVED_INT_ALB" != "None" ]]; then
+      warn "Internal ALB ingress not ready yet — using previously saved SSM value"
+      INT_ALB="$SAVED_INT_ALB"
+      kubectl create configmap ecommerce-config --namespace ecommerce \
+        --from-literal=aws_region="$REGION" \
+        --from-literal=redis_host="${REDIS_HOST:-placeholder}" \
+        --from-literal=redis_port="6379" \
+        --from-literal=sns_topic_arn="${SNS_TOPIC:-placeholder}" \
+        --from-literal=internal_alb_dns="http://$INT_ALB" \
+        --from-literal=ses_from_email="$SES_EMAIL" \
+        --dry-run=client -o yaml | kubectl apply -f -
+      success "ConfigMap updated with saved internal ALB: http://$INT_ALB"
+    else
+      warn "Could not resolve internal ALB DNS — frontend will start with internal_alb_dns=pending"
+      warn "Fix: kubectl create configmap ecommerce-config -n ecommerce --from-literal=internal_alb_dns='http://<INT_ALB_DNS>' --dry-run=client -o yaml | kubectl apply -f -"
+      warn "Then: kubectl rollout restart deployment/frontend-deployment -n ecommerce"
+    fi
   fi
+
+  # ── NOW deploy frontend — ConfigMap already has the correct internal ALB ──
+  info "Starting frontend deployment (ConfigMap is ready)"
+  kubectl apply -f "$K8S/frontend/deployment.yaml"
+  kubectl apply -f "$K8S/frontend/hpa.yaml" 2>/dev/null || true
+
+  # Wait for frontend pod
+  kubectl rollout status deployment/frontend-deployment \
+    --namespace ecommerce --timeout=300s \
+    && success "  frontend-deployment Ready" \
+    || warn "  frontend-deployment timeout — check: kubectl describe deployment frontend-deployment -n ecommerce"
 
   # ── Phase 8b: Route53 A-record → External ALB (no second terraform apply) ──
   # If domain is configured, create/update the A-record pointing to External ALB

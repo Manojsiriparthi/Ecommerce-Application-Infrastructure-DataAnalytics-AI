@@ -7,6 +7,8 @@ metadata:
     app: notification-service
     tier: backend
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -102,4 +104,5 @@ spec:
                   operator: In
                   values: [notification-service]
               topologyKey: kubernetes.io/hostname
+
 
