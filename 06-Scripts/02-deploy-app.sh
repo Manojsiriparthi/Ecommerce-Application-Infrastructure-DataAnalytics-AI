@@ -302,6 +302,89 @@ if [[ "$ACTION" == "deploy" ]]; then
       --region "$REGION" 2>/dev/null || true
   fi
 
+  # ── Phase 8b: Route53 A-record → External ALB (no second terraform apply) ──
+  # If domain is configured, create/update the A-record pointing to External ALB
+  # This replaces the need for a second terraform apply
+  if [[ -n "$EXT_ALB" ]]; then
+    DOMAIN=$(aws ssm get-parameter \
+      --name "/${PROJECT}/${ENV}/route53/domain-name" \
+      --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+
+    # Fall back: read from prod.tfvars
+    [[ -z "$DOMAIN" ]] && DOMAIN=$(grep "^domain_name" \
+      "$REPO_ROOT/01-Infrastructure/environments/${ENV}/${ENV}.tfvars" \
+      2>/dev/null | cut -d'"' -f2 | tr -d ' ' || echo "")
+
+    if [[ -n "$DOMAIN" && "$DOMAIN" != '""' ]]; then
+      ZONE_ID=$(aws route53 list-hosted-zones \
+        --query "HostedZones[?Name=='${DOMAIN}.'].Id" \
+        --output text 2>/dev/null | cut -d'/' -f3 || echo "")
+
+      if [[ -n "$ZONE_ID" && "$ZONE_ID" != "None" ]]; then
+        # ALB hosted zone ID for us-east-1
+        ALB_ZONE="Z35SXDOTRQ7X7K"
+        [[ "$REGION" == "ap-south-1" ]] && ALB_ZONE="Z11127IXD6XFTK"
+
+        info "Creating Route53 A-record: $DOMAIN → $EXT_ALB"
+
+        aws route53 change-resource-record-sets \
+          --hosted-zone-id "$ZONE_ID" \
+          --change-batch "{
+            \"Changes\": [
+              {
+                \"Action\": \"UPSERT\",
+                \"ResourceRecordSet\": {
+                  \"Name\": \"${DOMAIN}\",
+                  \"Type\": \"A\",
+                  \"AliasTarget\": {
+                    \"HostedZoneId\": \"${ALB_ZONE}\",
+                    \"DNSName\": \"${EXT_ALB}\",
+                    \"EvaluateTargetHealth\": true
+                  }
+                }
+              },
+              {
+                \"Action\": \"UPSERT\",
+                \"ResourceRecordSet\": {
+                  \"Name\": \"www.${DOMAIN}\",
+                  \"Type\": \"A\",
+                  \"AliasTarget\": {
+                    \"HostedZoneId\": \"${ALB_ZONE}\",
+                    \"DNSName\": \"${EXT_ALB}\",
+                    \"EvaluateTargetHealth\": true
+                  }
+                }
+              }
+            ]
+          }" \
+          --region "$REGION" 2>/dev/null && \
+          success "Route53 A-record created: $DOMAIN → $EXT_ALB" || \
+          warn "Route53 A-record update failed (zone may not exist yet)"
+
+        # Update ingress with cert ARN for HTTPS
+        CERT_ARN=$(aws ssm get-parameter \
+          --name "/${PROJECT}/${ENV}/acm/certificate-arn" \
+          --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+
+        if [[ -n "$CERT_ARN" && "$CERT_ARN" != "None" ]]; then
+          kubectl annotate ingress frontend-external-ingress \
+            -n ecommerce \
+            "alb.ingress.kubernetes.io/certificate-arn=${CERT_ARN}" \
+            "alb.ingress.kubernetes.io/listen-ports=[{\"HTTP\": 80}, {\"HTTPS\": 443}]" \
+            "alb.ingress.kubernetes.io/ssl-redirect=443" \
+            --overwrite 2>/dev/null && \
+            success "HTTPS enabled with ACM cert" || \
+            warn "Could not update ingress annotations"
+        fi
+      else
+        warn "Route53 hosted zone not found for $DOMAIN — run terraform apply first"
+      fi
+    else
+      info "No domain configured — skipping Route53 A-record"
+      info "To add domain: set domain_name in ${ENV}.tfvars and re-deploy"
+    fi
+  fi
+
   # ── Phase 8: Verify ──────────────────────────────────────────────────────
   header "Phase 8: Verify"
   echo ""
