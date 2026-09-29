@@ -28,15 +28,20 @@ metadata:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 
-    # WAF — value is the WAF WebACL ARN from Terraform output module.waf.web_acl_arn
-    # Replace <WAF_WEBACL_ARN> with the actual ARN after terraform apply
-    alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_WEBACL_ARN>"
+    # WAF — disabled until WAF ARN is stored in SSM after terraform apply
+    # To enable: uncomment and set the ARN from SSM:
+    #   aws ssm get-parameter --name /pip-project-ecommerce/prod/waf/web-acl-arn
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_WEBACL_ARN>"
 
-    # TLS — ACM certificate for your domain
-    # Replace <ACM_CERT_ARN> with the ACM cert ARN for your domain
-    alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN>"
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
-    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # TLS — disabled until domain + ACM certificate are ready
+    # When domain is registered:
+    #   1. Run: terraform apply (creates Route53 + ACM cert)
+    #   2. Get cert ARN: aws ssm get-parameter --name /pip-project-ecommerce/prod/acm/certificate-arn
+    #   3. Uncomment and set the certificate-arn annotation below
+    #   4. Change listen-ports to include HTTPS
+    # alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN>"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # alb.ingress.kubernetes.io/ssl-redirect: "443"
 
     # ALB access logs disabled — S3 bucket policy needs ELB service account to be configured first
     # Re-enable after running: terraform apply -target=module.waf

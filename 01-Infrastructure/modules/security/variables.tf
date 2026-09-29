@@ -60,3 +60,9 @@ variable "db_proxy_endpoint" {
   type        = string
   default     = ""
 }
+
+variable "db_username" {
+  description = "Aurora master username — used to construct DATABASE_URL in SSM"
+  type        = string
+  default     = "pipadmin"
+}

@@ -14,8 +14,8 @@ output "cluster_autoscaler_release_name" {
 }
 
 output "vpa_release_name" {
-  description = "VPA Helm release name"
-  value       = helm_release.vpa.name
+  description = "VPA Helm release name (disabled)"
+  value       = "vpa-disabled"
 }
 
 output "fluent_bit_release_name" {

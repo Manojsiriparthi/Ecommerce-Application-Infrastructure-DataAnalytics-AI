@@ -226,6 +226,55 @@ resource "aws_ssm_parameter" "ses_from_email" {
 }
 
 # ==============================================
+# SSM Parameters — DATABASE_URLs per service (SecureString)
+# ==============================================
+# Stored automatically by Terraform after Aurora + RDS Proxy are created.
+# db_proxy_endpoint is passed from module.aurora.proxy_endpoint in environments/*/main.tf
+#
+# Pods fetch DATABASE_URL from SSM via Secrets Store CSI driver.
+# WHY SSM not Secrets Manager:
+#   DATABASE_URL is a connection string — not a standalone secret.
+#   It contains the password but as part of a URL. Storing it in SSM
+#   SecureString is simpler and cheaper than Secrets Manager for this use case.
+#
+# WHY AUTOMATED:
+#   Previously this required manual CLI commands after each deploy.
+#   Now Terraform stores it automatically so pods always have the correct URL.
+# ==============================================
+
+locals {
+  # Only create DB URL params when proxy endpoint is known
+  db_urls_enabled = var.db_proxy_endpoint != ""
+
+  services_dbs = {
+    "user"    = "user_db"
+    "product" = "product_db"
+    "cart"    = "cart_db"
+    "order"   = "order_db"
+    "payment" = "payment_db"
+  }
+}
+
+resource "aws_ssm_parameter" "db_url" {
+  for_each = local.db_urls_enabled ? local.services_dbs : {}
+
+  name  = "/${var.project_name}/${var.environment}/db/${each.key}-url"
+  type  = "SecureString"
+  value = "postgresql://${var.db_username}:${var.db_password}@${var.db_proxy_endpoint}:5432/${each.value}?sslmode=require"
+  key_id = aws_kms_key.main.arn
+  description = "DATABASE_URL for ${each.key}-service → ${each.value} via RDS Proxy"
+
+  lifecycle {
+    ignore_changes = [value]  # Don't overwrite if password is rotated manually
+  }
+
+  tags = {
+    Name        = "${var.project_name}-${each.key}-db-url"
+    Environment = var.environment
+  }
+}
+
+# ==============================================
 # GuardDuty - threat detection
 # Rubric requirement: GuardDuty enabled, HIGH severity < 5
 # Detects: compromised EC2/EKS nodes, unusual API calls,

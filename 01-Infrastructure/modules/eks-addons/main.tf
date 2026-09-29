@@ -94,18 +94,22 @@ resource "helm_release" "metrics_server" {
 }
 
 # ==============================================
-# VPA (Vertical Pod Autoscaler - STABLE VERSION)
+# VPA (Vertical Pod Autoscaler)
+# DISABLED on small clusters (t3.small nodes with 11 pod limit)
+# VPA runs 3 pods (admission-controller, recommender, updater) consuming
+# 3 precious pod slots across worker nodes.
+# Enable when nodes are upgraded to t3.medium or larger.
 # ==============================================
-resource "helm_release" "vpa" {
-  name            = "vpa"
-  repository      = "https://charts.fairwinds.com/stable"
-  chart           = "vpa"
-  namespace       = "kube-system"
-  version         = "3.0.0" # Stable chart version
-  force_update    = true
-  cleanup_on_fail = true
-  wait            = false
-}
+# resource "helm_release" "vpa" {
+#   name            = "vpa"
+#   repository      = "https://charts.fairwinds.com/stable"
+#   chart           = "vpa"
+#   namespace       = "kube-system"
+#   version         = "3.0.0"
+#   force_update    = true
+#   cleanup_on_fail = true
+#   wait            = false
+# }
 
 # ==============================================
 # Fluent Bit
