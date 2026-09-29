@@ -72,7 +72,11 @@ resource "null_resource" "db_setup" {
 
   # ── LOCAL-EXEC ────────────────────────────────────────────────────────────
   provisioner "local-exec" {
-    # Pass everything as positional args so the script stays env-clean
+    # WHY env vars instead of positional args for the password:
+    #   Terraform suppresses ALL output from local-exec when ANY sensitive value
+    #   appears in the command string — even innocent log lines get hidden.
+    #   Moving the password to `environment {}` keeps it out of the command string,
+    #   so Terraform shows the script output normally while the password stays secret.
     command = <<-SHELL
       chmod +x "${local.db_setup_script}"
       bash "${local.db_setup_script}" \
@@ -80,16 +84,17 @@ resource "null_resource" "db_setup" {
         "${var.primary_region}" \
         "${aws_db_proxy.ecommerce.endpoint}" \
         "${var.master_username}" \
-        "${var.master_password}" \
         "${local.ecr_registry}" \
         "${var.project_name}"
     SHELL
 
-    # Use bash explicitly so heredoc syntax works on macOS + Linux
-    interpreter = ["bash", "-c"]
+    # Password passed as env var — read inside the script as $TF_DB_PASS
+    # This keeps the sensitive value out of the command string so Terraform
+    # does NOT suppress script output.
+    environment = {
+      TF_DB_PASS = var.master_password
+    }
 
-    # Timeout: Aurora proxy takes ~2 min after creation to accept connections.
-    # EKS pod startup is ~30s. Five migration pods × 1 min each = 5 min.
-    # Total budget: 15 minutes is safe.
+    interpreter = ["bash", "-c"]
   }
 }
