@@ -72,6 +72,7 @@ resource "aws_ssm_parameter" "db_url" {
   value       = "postgresql://${var.master_username}:${var.master_password}@${aws_db_proxy.ecommerce.endpoint}:5432/${each.value}?sslmode=require"
   key_id      = var.kms_key_arn
   description = "DATABASE_URL for ${each.key}-service via RDS Proxy"
+  overwrite   = true   # Allow updates when proxy endpoint changes
 
   lifecycle {
     ignore_changes = [value]  # Don't overwrite on password rotation

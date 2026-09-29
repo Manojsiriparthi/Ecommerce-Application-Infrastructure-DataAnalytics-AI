@@ -83,8 +83,13 @@ resource "aws_acm_certificate_validation" "ecommerce" {
     for record in aws_route53_record.cert_validation : record.fqdn
   ]
 
+  # WHY 45 min timeout:
+  # DNS validation requires Namecheap nameservers to point to Route53 first.
+  # Once Namecheap is updated (5-30 min) + DNS propagation, AWS validates.
+  # If this times out: Namecheap nameservers not updated yet.
+  # Fix: update Namecheap nameservers to Route53 NS values, then re-apply.
   timeouts {
-    create = "10m"
+    create = "45m"
   }
 }
 
