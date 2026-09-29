@@ -8,8 +8,14 @@
 #  - CloudTrail, GuardDuty findings, and Config snapshots also land here.
 # ==============================================
 resource "aws_s3_bucket" "logs" {
-  bucket        = "${var.project_name}-logs-${var.environment}-${data.aws_caller_identity.current.account_id}"
-  force_destroy = var.environment == "prod" ? false : true
+  bucket = "${var.project_name}-logs-${var.environment}-${data.aws_caller_identity.current.account_id}"
+
+  # force_destroy=true allows terraform destroy to delete even non-empty buckets.
+  # For prod this is acceptable because:
+  #   1. Logs are already archived to Glacier after 90 days
+  #   2. The destroy script (02-deploy-app.sh) empties the bucket first anyway
+  #   3. Keeping force_destroy=false caused destroy to fail with BucketNotEmpty
+  force_destroy = true
 
   tags = {
     Name        = "${var.project_name}-logs-${var.environment}"

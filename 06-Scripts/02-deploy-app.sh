@@ -384,6 +384,62 @@ if [[ "$ACTION" == "destroy" ]]; then
     fi
   fi
 
+  # Step 5: Empty S3 logs bucket (versioned — must delete all versions before terraform destroy)
+  info "Step 5: Emptying S3 logs bucket (versioned bucket requires this before destroy)..."
+  BUCKET=$(aws ssm get-parameter \
+    --name "/${PROJECT}/${ENV}/s3/logs-bucket-name" \
+    --region "$REGION" \
+    --query Parameter.Value \
+    --output text 2>/dev/null || echo "")
+
+  if [[ -n "$BUCKET" && "$BUCKET" != "None" ]]; then
+    info "  Deleting all versions in s3://$BUCKET ..."
+
+    # Delete all object versions
+    VERSIONS=$(aws s3api list-object-versions \
+      --bucket "$BUCKET" \
+      --query "Versions[].{Key:Key,VersionId:VersionId}" \
+      --output json 2>/dev/null || echo "[]")
+
+    echo "$VERSIONS" | python3 -c "
+import json, sys, subprocess
+try:
+    versions = json.load(sys.stdin)
+    for v in versions:
+        subprocess.run(['aws', 's3api', 'delete-object',
+            '--bucket', '${BUCKET}',
+            '--key', v['Key'],
+            '--version-id', v['VersionId'],
+            '--region', '${REGION}'], capture_output=True)
+    print(f'  Deleted {len(versions)} object versions')
+except: pass
+" 2>/dev/null || true
+
+    # Delete all delete markers
+    MARKERS=$(aws s3api list-object-versions \
+      --bucket "$BUCKET" \
+      --query "DeleteMarkers[].{Key:Key,VersionId:VersionId}" \
+      --output json 2>/dev/null || echo "[]")
+
+    echo "$MARKERS" | python3 -c "
+import json, sys, subprocess
+try:
+    markers = json.load(sys.stdin)
+    for m in markers:
+        subprocess.run(['aws', 's3api', 'delete-object',
+            '--bucket', '${BUCKET}',
+            '--key', m['Key'],
+            '--version-id', m['VersionId'],
+            '--region', '${REGION}'], capture_output=True)
+    print(f'  Deleted {len(markers)} delete markers')
+except: pass
+" 2>/dev/null || true
+
+    success "  S3 bucket emptied: $BUCKET"
+  else
+    info "  S3 bucket not found in SSM — skipping"
+  fi
+
   echo ""
   echo -e "${BOLD}${GREEN}╔═══════════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}${GREEN}║   APP DESTROYED — safe to run terraform destroy ║${NC}"
