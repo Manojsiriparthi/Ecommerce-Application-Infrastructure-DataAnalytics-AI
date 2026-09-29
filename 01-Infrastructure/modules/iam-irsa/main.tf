@@ -207,7 +207,11 @@ resource "aws_iam_policy" "ecommerce_services" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # ---- Secrets Manager: read only the project's secrets ----
+      # ---- Secrets Manager: read project secrets ----
+      # Pattern covers BOTH naming styles:
+      #   pip-project-ecommerce-db-credentials (hyphen style, no path)
+      #   pip-project-ecommerce/prod/redis/auth-token (path style)
+      # The -* suffix covers the random 6-char suffix AWS appends to secret ARNs
       {
         Sid    = "ReadSecretsManager"
         Effect = "Allow"
@@ -215,9 +219,12 @@ resource "aws_iam_policy" "ecommerce_services" {
           "secretsmanager:GetSecretValue",
           "secretsmanager:DescribeSecret"
         ]
-        Resource = "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*"
+        Resource = [
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}-*",
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*"
+        ]
       },
-      # ---- SSM Parameter Store: read non-sensitive config ----
+      # ---- SSM Parameter Store ----
       {
         Sid    = "ReadSSMParameters"
         Effect = "Allow"
@@ -226,21 +233,27 @@ resource "aws_iam_policy" "ecommerce_services" {
           "ssm:GetParameters",
           "ssm:GetParametersByPath"
         ]
-        Resource = "arn:aws:ssm:*:*:parameter/${var.project_name}/*"
+        Resource = [
+          "arn:aws:ssm:*:*:parameter/${var.project_name}/*",
+          "arn:aws:ssm:*:*:parameter/pip-project-ecommerce/*"
+        ]
       },
-      # ---- KMS: decrypt secrets encrypted with the project KMS key ----
+      # ---- KMS: decrypt secrets from Secrets Manager AND SSM SecureString ----
       {
         Sid    = "DecryptKMS"
         Effect = "Allow"
         Action = [
           "kms:Decrypt",
-          "kms:GenerateDataKey"
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
         ]
-        # Scoped to the project KMS key — filled by Terraform at apply time
         Resource = "*"
         Condition = {
           StringLike = {
-            "kms:ViaService" = "secretsmanager.*.amazonaws.com"
+            "kms:ViaService" = [
+              "secretsmanager.*.amazonaws.com",
+              "ssm.*.amazonaws.com"
+            ]
           }
         }
       },
@@ -312,5 +325,65 @@ resource "aws_iam_role" "secrets_store_csi" {
 
 resource "aws_iam_role_policy_attachment" "secrets_store_csi" {
   policy_arn = "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+  role       = aws_iam_role.secrets_store_csi.name
+}
+
+# Secrets Store CSI driver also needs SSM + KMS permissions
+resource "aws_iam_policy" "secrets_store_csi_policy" {
+  name        = "${var.project_name}-secrets-store-csi-policy"
+  description = "SSM + KMS permissions for Secrets Store CSI driver"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "SecretsManagerRead"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = [
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}-*",
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*"
+        ]
+      },
+      {
+        Sid    = "SSMRead"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParametersByPath"
+        ]
+        Resource = [
+          "arn:aws:ssm:*:*:parameter/${var.project_name}/*",
+          "arn:aws:ssm:*:*:parameter/pip-project-ecommerce/*"
+        ]
+      },
+      {
+        Sid    = "KMSDecrypt"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringLike = {
+            "kms:ViaService" = [
+              "secretsmanager.*.amazonaws.com",
+              "ssm.*.amazonaws.com"
+            ]
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "secrets_store_csi_custom" {
+  policy_arn = aws_iam_policy.secrets_store_csi_policy.arn
   role       = aws_iam_role.secrets_store_csi.name
 }

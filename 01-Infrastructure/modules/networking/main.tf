@@ -7,12 +7,14 @@ resource "aws_vpc" "ecommerce" {
   enable_dns_support   = true
 
   tags = {
-    Name        = "${var.project_name}-vpc"
-    Environment = var.environment
+    Name                                                   = "${var.project_name}-vpc"
+    Environment                                            = var.environment
+    # Required by EKS — allows cluster to discover this VPC and clean up ENIs on destroy
+    "kubernetes.io/cluster/${var.project_name}-cluster"    = "shared"
   }
 
   lifecycle {
-    prevent_destroy = false
+    prevent_destroy       = false
     create_before_destroy = false
   }
 }
@@ -327,9 +329,10 @@ resource "aws_network_acl" "database" {
 
 # --- Bastion SG (Public) ---
 resource "aws_security_group" "bastion" {
-  name        = "${var.project_name}-bastion-sg"
-  description = "SSH access for bastion host"
-  vpc_id      = aws_vpc.ecommerce.id
+  name                   = "${var.project_name}-bastion-sg"
+  description            = "SSH access for bastion host"
+  vpc_id                 = aws_vpc.ecommerce.id
+  revoke_rules_on_delete = true   # Cleans up rules before deleting SG — prevents ENI dependency loops
 
   ingress {
     description = "SSH"
@@ -358,9 +361,10 @@ resource "aws_security_group" "bastion" {
 # cluster SG). Self-referencing rule allows all node<->node and
 # node<->control-plane traffic tagged with this SG.
 resource "aws_security_group" "eks" {
-  name        = "${var.project_name}-eks-sg"
-  description = "EKS cluster security group"
-  vpc_id      = aws_vpc.ecommerce.id
+  name                   = "${var.project_name}-eks-sg"
+  description            = "EKS cluster security group"
+  vpc_id                 = aws_vpc.ecommerce.id
+  revoke_rules_on_delete = true
 
   ingress {
     description = "Allow HTTPS from VPC"
@@ -393,9 +397,10 @@ resource "aws_security_group" "eks" {
 
 # --- Aurora DB SG ---
 resource "aws_security_group" "aurora" {
-  name        = "${var.project_name}-aurora-sg"
-  description = "Aurora PostgreSQL access from private/db subnets"
-  vpc_id      = aws_vpc.ecommerce.id
+  name                   = "${var.project_name}-aurora-sg"
+  description            = "Aurora PostgreSQL access from private/db subnets"
+  vpc_id                 = aws_vpc.ecommerce.id
+  revoke_rules_on_delete = true
 
   ingress {
     description     = "PostgreSQL from EKS nodes"
@@ -428,9 +433,10 @@ resource "aws_security_group" "aurora" {
 
 # --- Jenkins SG (Private) ---
 resource "aws_security_group" "jenkins" {
-  name        = "${var.project_name}-jenkins-sg"
-  description = "Jenkins server - HTTPS and Jenkins UI from bastion/VPC only"
-  vpc_id      = aws_vpc.ecommerce.id
+  name                   = "${var.project_name}-jenkins-sg"
+  description            = "Jenkins server - HTTPS and Jenkins UI from bastion/VPC only"
+  vpc_id                 = aws_vpc.ecommerce.id
+  revoke_rules_on_delete = true
 
   ingress {
     description     = "Jenkins UI (8080) from bastion"

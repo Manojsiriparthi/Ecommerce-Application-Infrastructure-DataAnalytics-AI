@@ -52,6 +52,13 @@ resource "aws_eks_node_group" "workers" {
 
   instance_types = [var.worker_instance_type]
 
+  # Launch template — gives EC2 instances proper Name tags
+  # Without this, nodes show as "ip-10-x-x-x.ec2.internal" with no name
+  launch_template {
+    id      = aws_launch_template.workers.id
+    version = aws_launch_template.workers.latest_version
+  }
+
   labels = {
     "node-role" = "worker"
     "workload"  = "application"
@@ -62,13 +69,49 @@ resource "aws_eks_node_group" "workers" {
     Environment = var.environment
   }
 
-  # Wait until the private subnets have a real NAT route.
-  # Without this, nodes launch before internet egress is ready
-  # and hang retrying kubelet bootstrap / ECR pulls.
   depends_on = [
     aws_eks_cluster.ecommerce,
     var.private_route_dependency,
   ]
+}
+
+resource "aws_launch_template" "workers" {
+  name_prefix   = "${var.project_name}-workers-"
+  instance_type = var.worker_instance_type
+
+  # Name tag on each EC2 instance created by the node group
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "${var.project_name}-worker-node"
+      Environment = var.environment
+      Role        = "worker"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name        = "${var.project_name}-worker-volume"
+      Environment = var.environment
+      Backup      = "false"
+    }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"  # IMDSv2 required
+    http_put_response_hop_limit = 2           # 2 needed for containers inside pods
+  }
+
+  tags = {
+    Name        = "${var.project_name}-workers-lt"
+    Environment = var.environment
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ==============================================
@@ -106,6 +149,11 @@ resource "aws_eks_node_group" "public" {
 
   instance_types = [var.public_node_instance_type]
 
+  launch_template {
+    id      = aws_launch_template.public.id
+    version = aws_launch_template.public.latest_version
+  }
+
   labels = {
     "node-role" = "public"
     "workload"  = "alb-support"
@@ -117,6 +165,43 @@ resource "aws_eks_node_group" "public" {
   }
 
   depends_on = [aws_eks_cluster.ecommerce]
+}
+
+resource "aws_launch_template" "public" {
+  name_prefix   = "${var.project_name}-public-"
+  instance_type = var.public_node_instance_type
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "${var.project_name}-public-node"
+      Environment = var.environment
+      Role        = "public-alb-support"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name        = "${var.project_name}-public-volume"
+      Environment = var.environment
+    }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  tags = {
+    Name        = "${var.project_name}-public-lt"
+    Environment = var.environment
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ==============================================
