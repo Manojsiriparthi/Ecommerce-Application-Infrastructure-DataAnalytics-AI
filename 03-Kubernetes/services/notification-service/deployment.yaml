@@ -67,11 +67,11 @@ spec:
 
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "100m"
+            memory: "64Mi"
+            cpu: "50m"
           limits:
             memory: "256Mi"
-            cpu: "250m"
+            cpu: "200m"
 
         livenessProbe:
           httpGet:
@@ -102,3 +102,4 @@ spec:
                   operator: In
                   values: [notification-service]
               topologyKey: kubernetes.io/hostname
+

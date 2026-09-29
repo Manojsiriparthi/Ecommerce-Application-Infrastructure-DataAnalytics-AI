@@ -188,18 +188,28 @@ That "someone" is Kubernetes (EKS). It's a system that manages containers automa
 
 ```
 workers (private subnets, t3.small × 3):
-  → All application pods run here
-  → Private subnets = no public IP = internet cannot reach pods directly
+  → ALL application pods run here: frontend + all 6 backend services
+  → Private subnets = no public IP = internet CANNOT reach pods directly
+  → This is where your actual application lives
 
 public (public subnets, t3.micro × 1):
-  → Required for ALB ip-mode target routing
-  → ALB needs ENIs (network interfaces) in public subnets
-  → No application pods run here — only ALB support
+  → NO application pods run here — this is a common misconception
+  → Exists ONLY for ALB network plumbing (ENI registration)
+  → WHY: External ALB uses ip target-type, routing directly to pod IPs.
+    For the ALB to health-check pods, it needs a network interface (ENI)
+    in the same subnet as the ALB (public subnet).
+    EC2 nodes in public subnets provide those ENIs automatically.
+  → Frontend pods run in PRIVATE subnets on worker nodes.
+    The External ALB (public subnet) routes to frontend pods (private subnet)
+    via their private IPs — this works because both are in the same VPC.
 
 db_nodes (database subnets, DISABLED):
   → Reserved for future database workloads in the cluster
-  → Not needed now since Aurora is AWS-managed
+  → Not needed now since Aurora is AWS-managed (RDS)
 ```
+
+**Summary: ALL pods (frontend + backend) run in PRIVATE subnets on worker nodes.**
+The public node group is purely infrastructure plumbing for the ALB — not for application workloads.
 
 **Node Name Tags — why added:**  
 Without a launch template, EC2 instances show as `ip-10-1-11-129.ec2.internal` in the AWS console — no meaningful name. With the launch template, they show as `pip-project-ecommerce-worker-node` — easy to identify.

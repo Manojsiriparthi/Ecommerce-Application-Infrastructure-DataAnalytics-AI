@@ -76,6 +76,38 @@ resource "aws_kms_key" "main" {
           "kms:ListGrants"
         ]
         Resource = "*"
+      },
+      # Explicitly allow the services IRSA role to decrypt secrets
+      # This is required even though root account has access above —
+      # KMS evaluates both the key policy AND the IAM policy.
+      # The root statement allows IAM delegation but the specific role
+      # must also be explicitly listed for Secrets Manager decryption.
+      {
+        Sid    = "AllowServicesRoleDecrypt"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-services-role"
+        }
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+      },
+      # Allow secrets-store-csi-driver role to decrypt
+      {
+        Sid    = "AllowCSIDriverDecrypt"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-secrets-store-csi-role"
+        }
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -120,7 +152,15 @@ resource "aws_secretsmanager_secret_version" "db_creds" {
     password = var.db_password
     engine   = "postgres"
     port     = 5432
+    # host is the RDS Proxy endpoint — set after Aurora + Proxy are created
+    # The 01-setup-databases.sh script updates this value after first apply
+    # pods read host via JMESPath from this secret
+    host     = var.db_proxy_endpoint
   })
+
+  lifecycle {
+    ignore_changes = [secret_string]  # Don't overwrite if manually updated
+  }
 }
 
 # ==============================================

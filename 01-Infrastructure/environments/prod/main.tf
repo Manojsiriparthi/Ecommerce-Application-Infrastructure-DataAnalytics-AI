@@ -31,9 +31,10 @@ module "security" {
   internal_service_key = var.internal_service_key
   ses_from_email       = var.ses_from_email
   vpc_id               = module.networking.vpc_id
-  create_flow_logs     = true   # boolean — safe to evaluate at plan time
+  create_flow_logs     = true
+  db_proxy_endpoint    = module.aurora.proxy_endpoint
 
-  depends_on = [module.networking]
+  depends_on = [module.networking, module.aurora]
 }
 
 module "iam" {

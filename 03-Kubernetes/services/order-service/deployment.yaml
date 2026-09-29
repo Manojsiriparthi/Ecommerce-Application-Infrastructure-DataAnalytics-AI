@@ -75,11 +75,11 @@ spec:
 
         resources:
           requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
             memory: "256Mi"
             cpu: "200m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
 
         livenessProbe:
           httpGet:
@@ -110,3 +110,4 @@ spec:
                   operator: In
                   values: [order-service]
               topologyKey: kubernetes.io/hostname
+

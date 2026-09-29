@@ -49,3 +49,14 @@ variable "create_flow_logs" {
   type        = bool
   default     = false
 }
+
+variable "db_proxy_endpoint" {
+  description = <<-EOT
+    RDS Proxy endpoint — stored in the DB credentials secret so pods can
+    read host via JMESPath. Pass module.aurora.proxy_endpoint here.
+    Leave empty on first apply (proxy created after this module).
+    The 01-setup-databases.sh script updates the secret after first apply.
+  EOT
+  type        = string
+  default     = ""
+}

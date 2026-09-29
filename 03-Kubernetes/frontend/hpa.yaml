@@ -8,7 +8,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: frontend-deployment
-  minReplicas: 3
+  # Testing: min=1, restore to min=3 when vCPU limit raised
+  minReplicas: 1
   maxReplicas: 10
   metrics:
   - type: Resource
