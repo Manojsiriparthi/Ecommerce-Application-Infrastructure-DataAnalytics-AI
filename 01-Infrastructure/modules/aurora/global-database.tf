@@ -2,6 +2,8 @@
 # Aurora Global Database (Cross-Region DR)
 # ==============================================
 resource "aws_rds_global_cluster" "ecommerce" {
+  count = var.enable_global_db ? 1 : 0
+
   global_cluster_identifier = "${var.project_name}-global-db"
   engine                    = "aurora-postgresql"
   engine_version            = var.engine_version
@@ -50,7 +52,7 @@ resource "aws_rds_cluster" "secondary" {
   cluster_identifier        = "${var.project_name}-cluster-dr"
   engine                    = "aurora-postgresql"
   engine_version            = var.engine_version
-  global_cluster_identifier = aws_rds_global_cluster.ecommerce.id
+  global_cluster_identifier = aws_rds_global_cluster.ecommerce[0].id
   db_subnet_group_name      = var.dr_db_subnet_group_name
   vpc_security_group_ids    = [var.dr_aurora_sg_id]
   storage_encrypted         = true

@@ -32,8 +32,8 @@ output "instance_ids" {
 }
 
 output "global_cluster_id" {
-  description = "Aurora Global Database identifier"
-  value       = aws_rds_global_cluster.ecommerce.id
+  description = "Aurora Global Database identifier (empty when enable_global_db=false)"
+  value       = var.enable_global_db ? aws_rds_global_cluster.ecommerce[0].id : ""
 }
 
 output "proxy_id" {

@@ -15,7 +15,14 @@ resource "aws_rds_cluster" "primary" {
   storage_encrypted       = true
   kms_key_id              = var.kms_key_arn
 
-  global_cluster_identifier       = aws_rds_global_cluster.ecommerce.id
+  # IMPORTANT: global_cluster_identifier can only be set at cluster CREATION time.
+  # If the primary cluster already exists without it, you cannot add it later.
+  # To use Global Database:
+  #   1. Set enable_global_db = true BEFORE first terraform apply
+  #   2. OR destroy primary cluster and recreate with enable_global_db = true
+  # Setting this to null on an existing cluster that was created with it will
+  # REMOVE the cluster from the global database (allowed but irreversible without recreate)
+  global_cluster_identifier       = var.enable_global_db ? aws_rds_global_cluster.ecommerce[0].id : null
   db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.ecommerce.name
   enabled_cloudwatch_logs_exports = ["postgresql"]
   deletion_protection             = var.deletion_protection
