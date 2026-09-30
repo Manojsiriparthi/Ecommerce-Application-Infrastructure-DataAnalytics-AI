@@ -28,7 +28,7 @@ export default function ProductList({
     setError('');
 
     const url =
-      `${API.product}/api/products` +
+      `${API.product}` +
       `${gender ? `?gender=${encodeURIComponent(gender)}` : ''}`;
 
     apiFetch(url)
@@ -53,7 +53,7 @@ export default function ProductList({
 
   async function addToCart(product: Product) {
     const response = await apiFetch(
-      `${API.cart}/api/cart/items`,
+      `${API.cart}/items`,
       {
         method: 'POST',
 
