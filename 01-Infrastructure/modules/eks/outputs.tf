@@ -37,3 +37,13 @@ output "db_node_group_name" {
   description = "DB node group name (empty string when create_db_nodes = false)"
   value       = var.create_db_nodes ? aws_eks_node_group.db_nodes[0].node_group_name : ""
 }
+
+output "node_security_group_id" {
+  description = <<-EOT
+    The cluster security group ID that EKS automatically creates and attaches
+    to ALL worker nodes at cluster creation time. This is separate from the
+    Terraform-managed eks_sg (which only has the rules we define).
+    Aurora must allow inbound :5432 from this SG so pods can reach the DB.
+  EOT
+  value = aws_eks_cluster.ecommerce.vpc_config[0].cluster_security_group_id
+}

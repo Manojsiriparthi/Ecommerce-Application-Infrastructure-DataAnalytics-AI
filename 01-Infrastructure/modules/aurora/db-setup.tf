@@ -72,25 +72,26 @@ resource "null_resource" "db_setup" {
 
   # ── LOCAL-EXEC ────────────────────────────────────────────────────────────
   provisioner "local-exec" {
-    # WHY env vars instead of positional args for the password:
-    #   Terraform suppresses ALL output from local-exec when ANY sensitive value
-    #   appears in the command string — even innocent log lines get hidden.
-    #   Moving the password to `environment {}` keeps it out of the command string,
-    #   so Terraform shows the script output normally while the password stays secret.
+    # WHY writer endpoint (not proxy) for CREATE DATABASE:
+    #   RDS Proxy is for application connection pooling — it only supports
+    #   single-database connections per auth token. CREATE DATABASE requires
+    #   connecting to the `postgres` meta-database which the proxy cannot route.
+    #   The Aurora writer endpoint is the correct target for admin DDL.
+    #
+    # WHY password in environment{} not command:
+    #   Terraform suppresses ALL output when any sensitive value appears in
+    #   the command string. env vars keep it out of the command string.
     command = <<-SHELL
       chmod +x "${local.db_setup_script}"
       bash "${local.db_setup_script}" \
         "${var.cluster_name}" \
         "${var.primary_region}" \
-        "${aws_db_proxy.ecommerce.endpoint}" \
+        "${aws_rds_cluster.primary.endpoint}" \
         "${var.master_username}" \
         "${local.ecr_registry}" \
         "${var.project_name}"
     SHELL
 
-    # Password passed as env var — read inside the script as $TF_DB_PASS
-    # This keeps the sensitive value out of the command string so Terraform
-    # does NOT suppress script output.
     environment = {
       TF_DB_PASS = var.master_password
     }

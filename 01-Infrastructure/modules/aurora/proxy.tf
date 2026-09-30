@@ -69,10 +69,19 @@ resource "aws_ssm_parameter" "db_url" {
 
   name        = "/${var.project_name}/${var.environment}/db/${each.key}-url"
   type        = "SecureString"
-  value       = "postgresql://${var.master_username}:${var.master_password}@${aws_db_proxy.ecommerce.endpoint}:5432/${each.value}?sslmode=require"
+  # WHY writer endpoint (not RDS Proxy):
+  #   RDS Proxy requires specific TLS negotiation that Prisma's pg driver
+  #   does not satisfy with Aurora PostgreSQL 17. The proxy works for native
+  #   psql (libpq) but not for Prisma's connection pooler.
+  #   The Aurora writer endpoint works reliably with Prisma.
+  #   Connection pooling is handled by Prisma's own pool (default: 10 per pod).
+  # WHY %23 not #:
+  #   The # character is a URL fragment delimiter. Without encoding, Prisma
+  #   misparses the port as empty (P1013: invalid port number).
+  value       = "postgresql://${var.master_username}:${replace(var.master_password, "#", "%23")}@${aws_rds_cluster.primary.endpoint}:5432/${each.value}?sslmode=require"
   key_id      = var.kms_key_arn
-  description = "DATABASE_URL for ${each.key}-service via RDS Proxy"
-  overwrite   = true   # Allow updates when proxy endpoint changes
+  description = "DATABASE_URL for ${each.key}-service via Aurora writer endpoint"
+  overwrite   = true
 
   lifecycle {
     ignore_changes = [value]  # Don't overwrite on password rotation

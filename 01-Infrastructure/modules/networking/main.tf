@@ -403,12 +403,17 @@ resource "aws_security_group" "aurora" {
   revoke_rules_on_delete = true
 
   ingress {
-    description     = "PostgreSQL from EKS nodes"
+    description     = "PostgreSQL from EKS nodes (Terraform-managed SG)"
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.eks.id]
   }
+
+  # NOTE: EKS also auto-creates a second node SG (cluster_security_group_id)
+  # that is NOT the same as aws_security_group.eks above. That SG is added
+  # via a separate aws_security_group_rule in prod/main.tf (after EKS is
+  # created) to avoid a circular dependency between the networking and eks modules.
 
   ingress {
     description     = "PostgreSQL from bastion"

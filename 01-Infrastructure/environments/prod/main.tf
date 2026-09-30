@@ -251,6 +251,34 @@ module "monitoring" {
 }
 
 # ==============================================
+# Aurora SG — EKS auto-created node SG rule
+# ==============================================
+# WHY THIS IS HERE (not in networking/main.tf):
+#   EKS auto-creates a second SG (cluster_security_group_id) at cluster
+#   creation time and attaches it to every worker node. Terraform doesn't
+#   know this SG ID until AFTER aws_eks_cluster is created.
+#   networking/main.tf runs BEFORE eks/main.tf, so it cannot reference
+#   module.eks.node_security_group_id — that would be a circular dependency.
+#
+#   The solution: a standalone aws_security_group_rule here in prod/main.tf,
+#   which Terraform resolves AFTER both modules exist. This rule is what
+#   allows EKS pods to reach Aurora on port 5432.
+#
+# WITHOUT THIS RULE: pods get "connection timeout" to Aurora/RDS Proxy.
+# ==============================================
+resource "aws_security_group_rule" "aurora_allow_eks_nodes" {
+  type                     = "ingress"
+  description              = "PostgreSQL from EKS auto-created node SG (cluster_security_group_id)"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = module.networking.aurora_sg_id
+  source_security_group_id = module.eks.node_security_group_id
+
+  depends_on = [module.networking, module.eks]
+}
+
+# ==============================================
 # ==============================================
 # DR REGION (us-west-2) — WARM STANDBY
 # ==============================================

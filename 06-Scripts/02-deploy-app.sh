@@ -293,14 +293,14 @@ if [[ "$ACTION" == "deploy" ]]; then
   #   THEN start the frontend pod so it picks up the correct value on first boot.
   wait_alb() {
     local NAME="$1" DNS="" MAX=40
-    info "  Waiting for ingress/$NAME to get an ALB hostname (max ~$(( MAX * 15 ))s)..."
+    info "  Waiting for ingress/$NAME to get an ALB hostname (max ~$(( MAX * 15 ))s)..." >&2
     for i in $(seq 1 $MAX); do
       DNS=$(kubectl get ingress "$NAME" -n ecommerce \
         -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
       [[ -n "$DNS" ]] && { echo "$DNS"; return 0; }
-      echo -n "  [$i/$MAX] waiting..."; sleep 15; echo ""
+      echo -n "  [$i/$MAX] waiting..." >&2; sleep 15; echo "" >&2
     done
-    echo ""
+    echo "" >&2
     return 1
   }
 

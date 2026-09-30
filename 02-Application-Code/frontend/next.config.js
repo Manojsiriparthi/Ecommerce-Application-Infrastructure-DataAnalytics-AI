@@ -7,25 +7,27 @@
 // dependency on the internal ALB DNS.
 //
 // Flow:
-//   Browser → GET /api/users/health
-//   Next.js server rewrites → GET http://<internal-alb>/api/users/health
+//   Browser → GET /api/users/login
+//   Next.js server reads INTERNAL_API_URL from env at startup
+//   Rewrites → GET http://<internal-alb>/api/users/login
 //   Response returned to browser
 //
-// This means the same Docker image works in ALL environments
-// (dev, prod, DR) without rebuilding.
-
-const INTERNAL_API_URL = process.env.INTERNAL_API_URL || 'http://localhost';
+// IMPORTANT: The env var is read INSIDE rewrites() so it is evaluated
+// at server startup time (when the pod starts) not at build time.
+// This means the same Docker image works in ALL environments.
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
 
-  // Proxy all /api/* calls to the internal ALB at server runtime
   async rewrites() {
+    // Read at server startup — picks up the K8s env var injected by ConfigMap
+    const internalApiUrl = process.env.INTERNAL_API_URL || 'http://localhost';
+    console.log('[next.config] INTERNAL_API_URL =', internalApiUrl);
     return [
       {
         source: '/api/:path*',
-        destination: `${INTERNAL_API_URL}/api/:path*`,
+        destination: `${internalApiUrl}/api/:path*`,
       },
     ];
   },
