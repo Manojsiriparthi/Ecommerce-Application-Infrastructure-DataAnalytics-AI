@@ -315,7 +315,10 @@ resource "aws_wafv2_web_acl_logging_configuration" "ecommerce" {
 # IAM Role for Kinesis Firehose → S3
 # ==============================================
 resource "aws_iam_role" "firehose" {
-  name = "${var.project_name}-firehose-waf-role"
+  # environment suffix so primary (prod) and DR (prod-dr) don't collide —
+  # IAM role names are GLOBAL (account-wide), so both WAF modules would
+  # otherwise try to create the same role name.
+  name = "${var.project_name}-firehose-waf-role-${var.environment}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -327,13 +330,13 @@ resource "aws_iam_role" "firehose" {
   })
 
   tags = {
-    Name        = "${var.project_name}-firehose-waf-role"
+    Name        = "${var.project_name}-firehose-waf-role-${var.environment}"
     Environment = var.environment
   }
 }
 
 resource "aws_iam_role_policy" "firehose_s3" {
-  name = "${var.project_name}-firehose-s3-policy"
+  name = "${var.project_name}-firehose-s3-policy-${var.environment}"
   role = aws_iam_role.firehose.id
 
   policy = jsonencode({
