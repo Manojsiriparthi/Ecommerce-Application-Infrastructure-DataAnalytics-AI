@@ -48,3 +48,33 @@ variable "alb_zone_id" {
   type        = string
   default     = ""
 }
+
+# =============================================================================
+# Failover / DR variables
+# =============================================================================
+
+variable "dr_alb_dns_name" {
+  description = <<-EOT
+    DNS name of the DR region external ALB (us-west-2).
+    Leave empty to disable failover routing (simple A-records used instead).
+    Set after DR EKS cluster is running and ingress is applied.
+    When set, Route53 creates PRIMARY/SECONDARY failover records with health checks.
+  EOT
+  type    = string
+  default = ""
+}
+
+variable "dr_alb_zone_id" {
+  description = <<-EOT
+    Hosted Zone ID of the DR ALB (us-west-2 = Z1H1FL5HABSF5).
+    Required when dr_alb_dns_name is set.
+  EOT
+  type    = string
+  default = "Z1H1FL5HABSF5"   # us-west-2 ALB zone ID
+}
+
+variable "sns_topic_arn" {
+  description = "SNS topic ARN for health check failure alarms"
+  type        = string
+  default     = ""
+}

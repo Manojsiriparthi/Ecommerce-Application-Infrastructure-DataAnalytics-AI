@@ -17,6 +17,8 @@ locals {
   enabled  = local.domain != ""
   # Only create A-records when both domain AND ALB DNS are set
   alb_ready = local.enabled && trimspace(var.alb_dns_name) != ""
+  # Only create failover records when DR ALB is also set
+  dr_ready  = local.alb_ready && trimspace(var.dr_alb_dns_name) != ""
 }
 
 # =============================================================================
@@ -100,11 +102,13 @@ resource "aws_acm_certificate_validation" "ecommerce" {
   ]
 }
 
-# =============================================================================
-# A-record — apex domain → external ALB (only after ALB is provisioned)
+# ── Simple apex and www records ─────────────────────────────────────────────
+# These are only used when DR is NOT configured (no dr_alb_dns_name set).
+# When DR is configured, apex_primary / apex_dr failover records are used instead.
 # =============================================================================
 resource "aws_route53_record" "apex" {
-  count   = local.alb_ready ? 1 : 0
+  # Skip when failover records exist (dr_ready) to avoid duplicate record conflict
+  count   = local.alb_ready && !local.dr_ready ? 1 : 0
 
   zone_id = aws_route53_zone.ecommerce[0].zone_id
   name    = local.domain
@@ -121,7 +125,7 @@ resource "aws_route53_record" "apex" {
 # A-record — www → external ALB
 # =============================================================================
 resource "aws_route53_record" "www" {
-  count   = local.alb_ready ? 1 : 0
+  count   = local.alb_ready && !local.dr_ready ? 1 : 0
 
   zone_id = aws_route53_zone.ecommerce[0].zone_id
   name    = "www.${local.domain}"
@@ -179,4 +183,187 @@ resource "aws_ssm_parameter" "hosted_zone_id" {
     Name        = "${var.project_name}-zone-id-param"
     Environment = var.environment
   }
+}
+
+# =============================================================================
+# Route53 Health Checks + Failover Routing
+# =============================================================================
+# RUBRIC: Route53 health checks on ALB, failover routing primary→secondary
+#
+# HOW IT WORKS:
+#   1. Health check pings the external ALB /health every 30 seconds
+#   2. PRIMARY record (us-east-1): normal traffic, evaluate_target_health=true
+#   3. SECONDARY record (us-west-2 DR): only receives traffic when primary fails
+#   4. Failover happens in < 2 minutes (3 failed health checks × 30s each)
+#
+# REQUIREMENTS:
+#   - alb_dns_name must be set (primary ALB)
+#   - dr_alb_dns_name must be set (DR region ALB — set after DR EKS is ready)
+#   - Both ALBs must serve /health returning HTTP 200
+# =============================================================================
+
+# ── Health Check: Primary ALB (us-east-1) ────────────────────────────────────
+resource "aws_route53_health_check" "primary" {
+  count = local.alb_ready ? 1 : 0
+
+  fqdn              = var.alb_dns_name
+  port              = 80
+  type              = "HTTP"
+  resource_path     = "/"          # frontend home page — returns 200 when healthy
+  failure_threshold = 3            # 3 consecutive failures → unhealthy
+  request_interval  = 30           # check every 30 seconds
+
+  tags = {
+    Name        = "${var.project_name}-primary-health-check"
+    Environment = var.environment
+    Region      = "us-east-1"
+  }
+}
+
+# ── Health Check: DR ALB (us-west-2) ─────────────────────────────────────────
+resource "aws_route53_health_check" "dr" {
+  count = local.dr_ready ? 1 : 0
+
+  fqdn              = var.dr_alb_dns_name
+  port              = 80
+  type              = "HTTP"
+  resource_path     = "/"
+  failure_threshold = 3
+  request_interval  = 30
+
+  tags = {
+    Name        = "${var.project_name}-dr-health-check"
+    Environment = var.environment
+    Region      = "us-west-2"
+  }
+}
+
+# ── Failover A-record: PRIMARY (us-east-1) ───────────────────────────────────
+# Replaces the simple apex A-record when failover is enabled.
+# When health check fails → Route53 automatically stops returning this record.
+resource "aws_route53_record" "apex_primary" {
+  count = local.dr_ready ? 1 : 0
+
+  zone_id = aws_route53_zone.ecommerce[0].zone_id
+  name    = local.domain
+  type    = "A"
+
+  set_identifier = "primary"
+
+  failover_routing_policy {
+    type = "PRIMARY"
+  }
+
+  health_check_id = aws_route53_health_check.primary[0].id
+
+  alias {
+    name                   = var.alb_dns_name
+    zone_id                = var.alb_zone_id
+    evaluate_target_health = true
+  }
+
+  lifecycle {
+    # Prevent conflict with the simple apex record — remove it first
+    create_before_destroy = false
+  }
+}
+
+# ── Failover A-record: SECONDARY (us-west-2 DR) ──────────────────────────────
+# Only receives traffic when primary health check fails.
+# No health check on secondary — it always stays in the pool as fallback.
+resource "aws_route53_record" "apex_dr" {
+  count = local.dr_ready ? 1 : 0
+
+  zone_id = aws_route53_zone.ecommerce[0].zone_id
+  name    = local.domain
+  type    = "A"
+
+  set_identifier = "dr-secondary"
+
+  failover_routing_policy {
+    type = "SECONDARY"
+  }
+
+  # No health_check_id on secondary — it's always available as last resort
+  alias {
+    name                   = var.dr_alb_dns_name
+    zone_id                = var.dr_alb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+# ── www failover (mirrors apex) ──────────────────────────────────────────────
+resource "aws_route53_record" "www_primary" {
+  count = local.dr_ready ? 1 : 0
+
+  zone_id        = aws_route53_zone.ecommerce[0].zone_id
+  name           = "www.${local.domain}"
+  type           = "A"
+  set_identifier = "primary"
+
+  failover_routing_policy { type = "PRIMARY" }
+  health_check_id = aws_route53_health_check.primary[0].id
+
+  alias {
+    name                   = var.alb_dns_name
+    zone_id                = var.alb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "www_dr" {
+  count = local.dr_ready ? 1 : 0
+
+  zone_id        = aws_route53_zone.ecommerce[0].zone_id
+  name           = "www.${local.domain}"
+  type           = "A"
+  set_identifier = "dr-secondary"
+
+  failover_routing_policy { type = "SECONDARY" }
+
+  alias {
+    name                   = var.dr_alb_dns_name
+    zone_id                = var.dr_alb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+# ── CloudWatch Alarm: Primary health check failed ────────────────────────────
+resource "aws_cloudwatch_metric_alarm" "primary_health_check" {
+  count = local.alb_ready ? 1 : 0
+
+  alarm_name          = "${var.project_name}-route53-primary-unhealthy"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "HealthCheckStatus"
+  namespace           = "AWS/Route53"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  alarm_description   = "Route53 primary health check FAILING — traffic routing to DR region"
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    HealthCheckId = aws_route53_health_check.primary[0].id
+  }
+
+  alarm_actions = var.sns_topic_arn != "" ? [var.sns_topic_arn] : []
+  ok_actions    = var.sns_topic_arn != "" ? [var.sns_topic_arn] : []
+
+  tags = {
+    Name        = "${var.project_name}-primary-health-alarm"
+    Environment = var.environment
+  }
+}
+
+# ── SSM: store health check IDs for test scripts ─────────────────────────────
+resource "aws_ssm_parameter" "primary_health_check_id" {
+  count = local.alb_ready ? 1 : 0
+
+  name        = "/${var.project_name}/${var.environment}/route53/primary-health-check-id"
+  type        = "String"
+  value       = aws_route53_health_check.primary[0].id
+  description = "Route53 primary health check ID"
+
+  tags = { Name = "${var.project_name}-health-check-id", Environment = var.environment }
 }

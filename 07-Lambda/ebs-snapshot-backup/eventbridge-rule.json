@@ -1,0 +1,29 @@
+{
+  "_comment": "EventBridge Scheduled Rule — EBS Snapshot Backup every day at 12:00 PM UTC (5:30 PM IST)",
+  "_deploy_instructions": "This file is used by deploy.sh — do not apply manually",
+
+  "rule": {
+    "Name": "pip-project-ecommerce-ebs-backup-schedule",
+    "Description": "Trigger EBS snapshot backup Lambda daily at 12:00 PM UTC (5:30 PM IST). Chosen to avoid the 03:00 UTC maintenance window and 02:00 UTC secrets rotation.",
+    "ScheduleExpression": "cron(0 12 * * ? *)",
+    "State": "ENABLED",
+    "Tags": [
+      {"Key": "Project",     "Value": "pip-project-ecommerce"},
+      {"Key": "Environment", "Value": "prod"},
+      {"Key": "ManagedBy",   "Value": "terraform"}
+    ]
+  },
+
+  "target": {
+    "Id": "EBSBackupLambda",
+    "Input": "{\"retention_days\": 7}",
+    "_comment_schedule": "cron(0 12 * * ? *) = 12:00 UTC every day = 5:30 PM IST"
+  },
+
+  "_schedule_options": {
+    "daily_noon_utc":    "cron(0 12 * * ? *)   — every day at 12:00 UTC (ACTIVE)",
+    "daily_3am_utc":     "cron(0 3  * * ? *)   — every day at 03:00 UTC (off-peak)",
+    "dry_run_test":      "rate(5 minutes)       — for testing only, change Input to {\"dry_run\": true}",
+    "weekly_sunday":     "cron(0 12 ? * SUN *)  — weekly instead of daily (lower cost)"
+  }
+}

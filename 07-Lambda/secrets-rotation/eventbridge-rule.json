@@ -1,0 +1,29 @@
+{
+  "_comment": "EventBridge Scheduled Rule — Secrets Rotation every 30 days at 2:00 AM UTC",
+  "_deploy_instructions": "This file is used by deploy.sh — do not apply manually",
+
+  "rule": {
+    "Name": "pip-project-ecommerce-secrets-rotation-schedule",
+    "Description": "Trigger secrets rotation Lambda every 30 days at 2:00 AM UTC (7:30 AM IST). Low-traffic window chosen to minimise impact of JWT secret rotation (all sessions invalidated).",
+    "ScheduleExpression": "cron(0 2 1 * ? *)",
+    "State": "ENABLED",
+    "Tags": [
+      {"Key": "Project",     "Value": "pip-project-ecommerce"},
+      {"Key": "Environment", "Value": "prod"},
+      {"Key": "ManagedBy",   "Value": "terraform"}
+    ]
+  },
+
+  "target": {
+    "Id": "SecretsRotationLambda",
+    "Input": "{\"rotate\": \"all\"}",
+    "_comment_schedule": "cron(0 2 1 * ? *) = 02:00 UTC on the 1st of every month"
+  },
+
+  "_schedule_options": {
+    "monthly_first":    "cron(0 2 1 * ? *)    — 1st of each month at 02:00 UTC",
+    "every_30_days":    "rate(30 days)         — every 30 days from creation",
+    "every_90_days":    "cron(0 2 1 1,4,7,10 ? *) — quarterly (Jan/Apr/Jul/Oct)",
+    "db_only_weekly":   "cron(0 2 ? * SUN *)  — DB password every Sunday (aggressive)"
+  }
+}

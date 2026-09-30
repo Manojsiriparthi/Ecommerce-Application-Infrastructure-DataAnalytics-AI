@@ -39,3 +39,21 @@ variable "nat_gateway_id" {
   type        = string
   default     = ""
 }
+
+variable "internal_alb_arn_suffix" {
+  description = "ARN suffix of the internal ALB (for application dashboard)"
+  type        = string
+  default     = ""
+}
+
+variable "slack_webhook_url" {
+  description = <<-EOT
+    Slack Incoming Webhook URL for alarm notifications.
+    Set post-deploy via aws lambda update-function-configuration to avoid
+    storing the URL in Terraform state.
+    Leave empty here — set directly on the Lambda function.
+  EOT
+  type      = string
+  default   = ""
+  sensitive = true
+}

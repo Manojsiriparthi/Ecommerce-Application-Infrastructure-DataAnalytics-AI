@@ -166,7 +166,7 @@ if [[ "$ACTION" == "deploy" ]]; then
   WAF_ARN=$(ssm "waf/web-acl-arn")
   LOGS_BUCKET=$(ssm "s3/logs-bucket-name")
   SES_EMAIL=$(ssm "app/ses-from-email")
-  SES_EMAIL="${SES_EMAIL:-noreply@ecommerce-pip.com}"
+  SES_EMAIL="${SES_EMAIL:-noreply@pip-ecommerce.com}"
 
   PUB_IDS=$(aws ec2 describe-subnets \
     --filters "Name=tag:Name,Values=${PROJECT}-public-*" \

@@ -1,0 +1,71 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:497149484677:log-group:/aws/lambda/pip-project-ecommerce-secrets-rotation:*"
+    },
+    {
+      "Sid": "SecretsManagerRotate",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:PutSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:497149484677:secret:pip-project-ecommerce-db-credentials*"
+    },
+    {
+      "Sid": "SSMUpdateParameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:PutParameter",
+        "ssm:DescribeParameters"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:497149484677:parameter/pip-project-ecommerce/*"
+    },
+    {
+      "Sid": "RDSModifyPassword",
+      "Effect": "Allow",
+      "Action": [
+        "rds:ModifyDBCluster",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBInstances"
+      ],
+      "Resource": "arn:aws:rds:us-east-1:497149484677:cluster:pip-project-ecommerce-cluster"
+    },
+    {
+      "Sid": "KMSDecryptEncrypt",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ResourceAliases": "alias/pip-project-ecommerce-kms"
+        }
+      }
+    },
+    {
+      "Sid": "SNSPublishNotification",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "arn:aws:sns:us-east-1:497149484677:pip-project-ecommerce*"
+    }
+  ]
+}
