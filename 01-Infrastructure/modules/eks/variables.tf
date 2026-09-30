@@ -68,9 +68,14 @@ variable "worker_disk_size" {
 }
 
 variable "public_disk_size" {
-  description = "EBS root volume size (GB) for public (ALB-support) nodes"
+  description = "EBS root volume size (GB) for public (ALB-support) nodes. Minimum 20 (EKS AMI snapshot size)."
   type        = number
-  default     = 15
+  default     = 20
+
+  validation {
+    condition     = var.public_disk_size >= 20
+    error_message = "public_disk_size must be >= 20 GB (EKS AMI snapshot minimum)."
+  }
 }
 
 variable "workers_desired" {

@@ -73,7 +73,7 @@ module "eks" {
   public_desired            = 1
   public_min                = 1
   public_max                = 3
-  public_disk_size          = 15   # 15GB — public nodes run no app pods
+  public_disk_size          = 20   # 20GB — EKS AMI snapshot minimum (can't go lower)
 
   # DB nodes — disabled: Aurora is AWS-managed
   create_db_nodes = false
@@ -162,7 +162,8 @@ module "aurora" {
   db_secret_arn        = module.security.db_secret_arn
   instance_class       = var.aurora_instance_class
   reader_count         = var.aurora_reader_count
-  deletion_protection  = true
+  deletion_protection  = true   # production DB protected. To destroy later, set
+                                 # false first, apply, then destroy.
   sns_topic_arn        = module.messaging.sns_topic_arn
 
   # DB/table creation removed from Terraform (was hanging apply via local-exec).
@@ -361,7 +362,7 @@ module "eks_dr" {
   public_desired            = 1
   public_min                = 1
   public_max                = 3
-  public_disk_size          = 15   # 15GB — public node runs no app pods
+  public_disk_size          = 20   # 20GB — EKS AMI snapshot minimum (can't go lower)
 
   create_db_nodes = false
 

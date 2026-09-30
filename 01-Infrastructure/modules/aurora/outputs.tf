@@ -67,7 +67,4 @@ output "secondary_cluster_endpoint" {
   value       = var.enable_global_db ? aws_rds_cluster.secondary[0].endpoint : ""
 }
 
-output "global_cluster_id" {
-  description = "Aurora Global Database identifier. Empty when Global DB disabled."
-  value       = var.enable_global_db ? aws_rds_global_cluster.ecommerce[0].id : ""
-}
+# NOTE: global_cluster_id output already defined above (line 34) — do not duplicate.

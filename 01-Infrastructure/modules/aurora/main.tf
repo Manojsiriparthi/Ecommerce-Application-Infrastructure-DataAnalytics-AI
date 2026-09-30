@@ -15,15 +15,10 @@ resource "aws_rds_cluster" "primary" {
   storage_encrypted       = true
   kms_key_id              = var.kms_key_arn
 
-  # global_cluster_identifier links this primary to the Aurora Global Database.
-  # When enable_global_db = true, Terraform sets this at cluster creation so the
-  # primary is born as part of the global cluster and replicates to the DR
-  # secondary (us-west-2) with < 1 second lag.
-  #
-  # NOTE: enabling this on an EXISTING standalone cluster forces a recreate
-  # (Terraform replaces the cluster). That is acceptable here — test data only.
-  # After apply, re-seed the DB (prisma db push + product seed). From then on,
-  # all data replicates to DR automatically = real DR with no future data loss.
+  # global_cluster_identifier links this primary to the Global Database.
+  # Set at CREATION time (fresh cluster) so the primary is born inside the global
+  # cluster — no "existing cluster" error. We destroy the old standalone Aurora
+  # first, so this is a clean fresh create.
   global_cluster_identifier       = var.enable_global_db ? aws_rds_global_cluster.ecommerce[0].id : null
   db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.ecommerce.name
   enabled_cloudwatch_logs_exports = ["postgresql"]
