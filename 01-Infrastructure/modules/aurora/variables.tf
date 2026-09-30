@@ -216,26 +216,8 @@ variable "dr_reader_count" {
 
 
 
-# ==============================================
-# DB Setup (db-setup.tf) variables
-# ==============================================
-
-variable "account_id" {
-  description = "AWS account ID — used to build the ECR registry URL"
-  type        = string
-}
-
-variable "cluster_name" {
-  description = "EKS cluster name — kubectl connects here to run migration pods"
-  type        = string
-}
-
-variable "force_db_setup" {
-  description = <<-EOT
-    Set to any non-empty string to force db_setup to re-run on next terraform apply.
-    Example in prod.tfvars:  force_db_setup = "2026-09-27"
-    Leave empty for normal behaviour (only re-runs when proxy endpoint/password changes).
-  EOT
-  type    = string
-  default = ""
-}
+# NOTE: DB/table creation is NO LONGER done in Terraform.
+# It was removed because the local-exec provisioner hung terraform apply.
+# Databases + tables are now created by the standalone script:
+#   ./06-Scripts/01-setup-databases.sh prod us-east-1
+# Run it after terraform apply completes and before deploying the app.

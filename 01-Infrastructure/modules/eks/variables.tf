@@ -61,6 +61,18 @@ variable "worker_instance_type" {
   default     = "t3.medium"
 }
 
+variable "worker_disk_size" {
+  description = "EBS root volume size (GB) for private worker nodes"
+  type        = number
+  default     = 25
+}
+
+variable "public_disk_size" {
+  description = "EBS root volume size (GB) for public (ALB-support) nodes"
+  type        = number
+  default     = 15
+}
+
 variable "workers_desired" {
   description = "Desired number of worker nodes"
   type        = number

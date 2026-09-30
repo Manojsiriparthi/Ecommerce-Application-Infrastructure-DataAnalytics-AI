@@ -194,12 +194,14 @@ variable "enable_compute" {
   default     = false
 }
 
-variable "force_db_setup" {
+# force_db_setup variable removed — DB/table creation no longer in Terraform.
+# Use ./06-Scripts/01-setup-databases.sh instead.
+
+variable "dr_alb_dns_name" {
   description = <<-EOT
-    Set to any non-empty string to force the aurora db_setup null_resource
-    to re-run on next terraform apply (creates DBs + runs prisma db push again).
-    Example: force_db_setup = "2026-09-27-run2"
-    Leave empty ("") for normal idempotent behaviour.
+    DNS name of the DR region (us-west-2) external ALB.
+    Empty until the app is deployed to DR and its ALB is provisioned.
+    When set, route53_acm creates PRIMARY/SECONDARY failover records.
   EOT
   type    = string
   default = ""

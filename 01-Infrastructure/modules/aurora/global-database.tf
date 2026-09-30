@@ -78,3 +78,43 @@ resource "aws_rds_cluster_instance" "secondary" {
 
   performance_insights_enabled = var.performance_insights_enabled
 }
+
+# ==============================================
+# DR Region SSM DATABASE_URLs (us-west-2)
+# ==============================================
+# The DR app reads these to connect to the DR Aurora secondary cluster.
+#
+# IMPORTANT — read-only until failover:
+#   The DR secondary is READ-ONLY while the primary is healthy. The DR app
+#   can read (products load, browse works) but writes (register/login writing
+#   sessions) fail until the DR cluster is PROMOTED during failover.
+#   After promotion (aws rds failover-global-cluster), the secondary becomes
+#   writable and the app is fully functional.
+#
+# The reader endpoint is used here — after promotion it automatically accepts
+# writes as the new primary writer endpoint.
+# ==============================================
+
+resource "aws_ssm_parameter" "dr_db_url" {
+  for_each = var.enable_global_db ? local.services_dbs : {}
+
+  provider = aws.dr
+
+  name   = "/${var.project_name}/${var.environment}/db/${each.key}-url"
+  type   = "SecureString"
+  # DR secondary cluster endpoint. # in password is URL-encoded as %23.
+  value  = "postgresql://${var.master_username}:${replace(var.master_password, "#", "%23")}@${aws_rds_cluster.secondary[0].endpoint}:5432/${each.value}?sslmode=require"
+  key_id = var.dr_kms_key_arn != "" ? var.dr_kms_key_arn : aws_kms_key.dr_aurora[0].arn
+
+  description = "DR DATABASE_URL for ${each.key}-service (Aurora secondary, us-west-2)"
+  overwrite   = true
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = {
+    Name        = "${var.project_name}-${each.key}-db-url-dr"
+    Environment = "${var.environment}-dr"
+  }
+}

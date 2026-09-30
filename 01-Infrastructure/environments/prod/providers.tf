@@ -44,27 +44,38 @@ provider "aws" {
 # This is identical to how dev works (dev also uses ~/.kube/config).
 # ==============================================
 
+# PRIMARY (us-east-1) — uses the kubeconfig context for the primary cluster.
+# config_context pins it to the primary cluster ARN so it never accidentally
+# uses the DR context when both are in ~/.kube/config.
 provider "helm" {
   kubernetes {
-    config_path = "~/.kube/config"
+    config_path    = "~/.kube/config"
+    config_context = "arn:aws:eks:${var.primary_region}:${data.aws_caller_identity.current.account_id}:cluster/pip-project-ecommerce-cluster"
   }
 }
 
 provider "kubernetes" {
-  config_path = "~/.kube/config"
+  config_path    = "~/.kube/config"
+  config_context = "arn:aws:eks:${var.primary_region}:${data.aws_caller_identity.current.account_id}:cluster/pip-project-ecommerce-cluster"
 }
 
-# DR providers — aliased, used only by DR EKS addons if needed
+# DR (us-west-2) — pinned to the DR cluster context.
+# Both clusters share the name pip-project-ecommerce-cluster but live in
+# different regions, so the context ARN (which includes the region) is unique.
+# Run before applying DR addons:
+#   aws eks update-kubeconfig --name pip-project-ecommerce-cluster --region us-west-2
 provider "helm" {
   alias = "dr"
   kubernetes {
-    config_path = "~/.kube/config"
+    config_path    = "~/.kube/config"
+    config_context = "arn:aws:eks:${var.dr_region}:${data.aws_caller_identity.current.account_id}:cluster/pip-project-ecommerce-cluster"
   }
 }
 
 provider "kubernetes" {
-  alias       = "dr"
-  config_path = "~/.kube/config"
+  alias          = "dr"
+  config_path    = "~/.kube/config"
+  config_context = "arn:aws:eks:${var.dr_region}:${data.aws_caller_identity.current.account_id}:cluster/pip-project-ecommerce-cluster"
 }
 
 # ==============================================

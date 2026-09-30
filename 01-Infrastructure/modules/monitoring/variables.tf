@@ -57,3 +57,13 @@ variable "slack_webhook_url" {
   default   = ""
   sensitive = true
 }
+
+variable "sns_slack_lambda_deployed" {
+  description = <<-EOT
+    Set to true after running: ./07-Lambda/deploy.sh prod us-east-1 deploy sns-to-slack
+    This enables the SNS → Lambda subscription so alarms flow to Slack.
+    Default false so terraform apply doesn't fail before Lambda exists.
+  EOT
+  type    = bool
+  default = false
+}

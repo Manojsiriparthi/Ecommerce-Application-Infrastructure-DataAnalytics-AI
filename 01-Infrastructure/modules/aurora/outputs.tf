@@ -56,3 +56,18 @@ output "cloudwatch_alarm_arns" {
     aws_cloudwatch_metric_alarm.global_replica_lag.arn
   ]
 }
+
+output "dr_kms_key_arn" {
+  description = "KMS key ARN in the DR region (us-west-2) — created when enable_global_db=true. Used by DR WAF S3 bucket + DR SSM params."
+  value       = var.enable_global_db ? aws_kms_key.dr_aurora[0].arn : ""
+}
+
+output "secondary_cluster_endpoint" {
+  description = "DR Aurora secondary cluster endpoint (us-west-2). Empty when Global DB disabled."
+  value       = var.enable_global_db ? aws_rds_cluster.secondary[0].endpoint : ""
+}
+
+output "global_cluster_id" {
+  description = "Aurora Global Database identifier. Empty when Global DB disabled."
+  value       = var.enable_global_db ? aws_rds_global_cluster.ecommerce[0].id : ""
+}

@@ -60,19 +60,20 @@ module "eks" {
   private_route_dependency  = module.networking.private_route_table_association_ids
   database_route_dependency = module.networking.database_route_table_association_ids
 
-  # Worker nodes — t3.small to fit within 8 vCPU account limit
-  # 3×t3.small = 6 vCPU, one node per AZ for high availability
+  # PRIMARY worker nodes — t3.small, 3 nodes (one per AZ) = 6 vCPU
   # Total: 6 (workers) + 1 (public t3.micro) = 7 vCPU — fits under 8 limit
   worker_instance_type = var.worker_instance_type
   workers_desired      = 3    # one node per AZ (us-east-1a, 1b, 1c)
   workers_min          = 3
   workers_max          = 6
+  worker_disk_size     = 25   # 25GB root volume per worker
 
   # Public nodes — t3.micro (1 vCPU, ALB support only, no application pods)
   public_node_instance_type = var.public_node_instance_type
   public_desired            = 1
   public_min                = 1
   public_max                = 3
+  public_disk_size          = 15   # 15GB — public nodes run no app pods
 
   # DB nodes — disabled: Aurora is AWS-managed
   create_db_nodes = false
@@ -93,6 +94,12 @@ module "iam_irsa" {
 
 module "eks_addons" {
   source = "../../modules/eks-addons"
+
+  providers = {
+    aws        = aws
+    helm       = helm
+    kubernetes = kubernetes
+  }
 
   project_name                = "pip-project-ecommerce"
   cluster_name                = module.eks.cluster_name
@@ -158,10 +165,8 @@ module "aurora" {
   deletion_protection  = true
   sns_topic_arn        = module.messaging.sns_topic_arn
 
-  # DB setup (null_resource local-exec) — creates databases + tables after Aurora is ready
-  account_id     = data.aws_caller_identity.current.account_id
-  cluster_name   = module.eks.cluster_name
-  force_db_setup = var.force_db_setup
+  # DB/table creation removed from Terraform (was hanging apply via local-exec).
+  # Run ./06-Scripts/01-setup-databases.sh after apply instead.
 
   enable_global_db = var.enable_global_db
   primary_region   = var.primary_region
@@ -171,8 +176,9 @@ module "aurora" {
   dr_db_subnet_group_name = module.networking_dr.db_subnet_group_name
   dr_aurora_sg_id         = module.networking_dr.aurora_sg_id
 
-  # Must wait for EKS + addons ready — migration pods need worker nodes
-  depends_on = [module.networking, module.security, module.messaging, module.networking_dr, module.eks_addons]
+  # Aurora no longer depends on EKS (db_setup local-exec removed).
+  # It only needs networking, security (KMS), messaging (SNS), and DR networking.
+  depends_on = [module.networking, module.security, module.messaging, module.networking_dr]
 }
 
 module "elasticache" {
@@ -217,6 +223,13 @@ module "route53_acm" {
   domain_name  = var.domain_name
   alb_dns_name = var.alb_dns_name
   alb_zone_id  = var.alb_dns_name != "" ? "Z35SXDOTRQ7X7K" : ""
+
+  # DR failover — when dr_alb_dns_name is set, Route53 creates PRIMARY/SECONDARY
+  # failover records with a health check on the primary ALB.
+  # us-west-2 ALB hosted zone ID = Z1H1FL5HABSF5
+  dr_alb_dns_name = var.dr_alb_dns_name
+  dr_alb_zone_id  = "Z1H1FL5HABSF5"
+  sns_topic_arn   = module.messaging.sns_topic_arn
 
   depends_on = [module.waf]
 }
@@ -296,8 +309,12 @@ module "networking_dr" {
     aws = aws.dr
   }
 
-  project_name     = "pip-project-ecommerce"
-  environment      = "${var.environment}-dr"
+  project_name = "pip-project-ecommerce"
+  # environment = "prod" (same as primary) — DR is the SAME prod environment,
+  # just in a different region. Resources are regional so names don't clash,
+  # and the deploy script uses ENV=prod for both regions (same SSM paths,
+  # same subnet tag filter Environment=prod).
+  environment      = var.environment
   vpc_cidr         = var.dr_vpc_cidr
   azs              = var.dr_azs
   public_subnets   = var.dr_public_subnets
@@ -315,8 +332,8 @@ module "eks_dr" {
     aws = aws.dr
   }
 
-  project_name   = "pip-project-ecommerce"
-  environment    = "${var.environment}-dr"
+  project_name    = "pip-project-ecommerce"
+  environment     = var.environment   # "prod" — same env, different region
   cluster_version = var.eks_cluster_version
 
   # ── REUSE PRIMARY IAM ROLES — no separate iam_dr module needed ──
@@ -330,17 +347,21 @@ module "eks_dr" {
   private_route_dependency  = module.networking_dr.private_route_table_association_ids
   database_route_dependency = module.networking_dr.database_route_table_association_ids
 
-  # t3.micro — just enough for CoreDNS + system pods to stay healthy
-  # During failover: change to t3.medium + desired=3 → rolling replace, zero downtime
-  worker_instance_type = "t3.micro"
-  workers_desired      = 1
-  workers_min          = 1
-  workers_max          = 10
+  # DR: 3 private worker nodes across 3 AZs (mirrors primary) + 1 public node
+  # vCPU cost: 3×t3.small = 6 vCPU workers + 1×t3.micro = 1 vCPU public = 7 vCPU
+  # (fits under the 8 vCPU limit in us-west-2, same budget as primary)
+  worker_instance_type = "t3.small"
+  workers_desired      = 3
+  workers_min          = 3
+  workers_max          = 6
+  worker_disk_size     = 25   # 25GB root volume per worker
 
+  # Public node — needed for ALB ip-mode target routing (same as primary)
   public_node_instance_type = "t3.micro"
   public_desired            = 1
   public_min                = 1
   public_max                = 3
+  public_disk_size          = 15   # 15GB — public node runs no app pods
 
   create_db_nodes = false
 
@@ -364,6 +385,112 @@ module "iam_irsa_dr" {
   oidc_provider_url = replace(module.eks_dr.oidc_provider_url, "https://", "")
 
   depends_on = [module.eks_dr]
+}
+
+# ==============================================
+# DR WAF (us-west-2) — regional WebACL for the DR external ALB
+# ==============================================
+# Same WAF module, DR provider. Note the different elb_account_id for us-west-2
+# (797873946194) — this is the AWS account that writes ALB logs in that region.
+# ==============================================
+# Dedicated KMS key in DR region for the WAF S3 logs bucket.
+# Kept separate from aurora's DR key so waf_dr does NOT depend on the large
+# aurora module (avoids a long dependency chain through db_setup/eks_addons).
+resource "aws_kms_key" "dr_logs" {
+  provider = aws.dr
+
+  description             = "KMS key for DR region WAF/ALB S3 logs bucket"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = {
+    Name        = "pip-project-ecommerce-dr-logs-kms"
+    Environment = "${var.environment}-dr"
+  }
+}
+
+resource "aws_kms_alias" "dr_logs" {
+  provider      = aws.dr
+  name          = "alias/pip-project-ecommerce-dr-logs-kms"
+  target_key_id = aws_kms_key.dr_logs.key_id
+}
+
+module "waf_dr" {
+  source = "../../modules/waf"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  project_name = "pip-project-ecommerce"
+  # environment = "prod-dr" here ONLY because the WAF module creates an S3
+  # bucket, and S3 bucket names are GLOBALLY unique across all regions.
+  # Primary bucket: pip-project-ecommerce-logs-prod-<acct>
+  # DR bucket:      pip-project-ecommerce-logs-prod-dr-<acct>  ← must differ
+  # The WebACL itself is regional so the name doesn't actually need -dr,
+  # but keeping it consistent avoids confusion.
+  environment         = "${var.environment}-dr"
+  kms_key_arn         = aws_kms_key.dr_logs.arn
+  elb_account_id      = "797873946194"   # us-west-2 ELB service account
+  log_transition_days = 365
+  log_expiration_days = 730
+
+  depends_on = [module.networking_dr]
+}
+
+# ==============================================
+# DR EKS Addons — LB Controller, EBS CSI, Secrets Store CSI (us-west-2)
+# ==============================================
+# CRITICAL for DR: installs the AWS Load Balancer Controller so applying
+# frontend/ingress.yaml in the DR cluster provisions a real ALB. Without
+# this, no DR ALB exists and failover has no target.
+#
+# Uses aws.dr + helm.dr + kubernetes.dr providers (pinned to us-west-2 cluster).
+#
+# BEFORE APPLYING THIS MODULE, run:
+#   aws eks update-kubeconfig --name pip-project-ecommerce-cluster --region us-west-2
+# so the helm.dr/kubernetes.dr providers can reach the DR cluster.
+# ==============================================
+module "eks_addons_dr" {
+  source = "../../modules/eks-addons"
+
+  providers = {
+    aws        = aws.dr
+    helm       = helm.dr
+    kubernetes = kubernetes.dr
+  }
+
+  project_name                = "pip-project-ecommerce"
+  cluster_name                = module.eks_dr.cluster_name
+  region                      = var.dr_region
+  vpc_id                      = module.networking_dr.vpc_id
+  ebs_csi_role_arn            = module.iam_irsa_dr.ebs_csi_role_arn
+  lb_controller_role_arn      = module.iam_irsa_dr.lb_controller_role_arn
+  cluster_autoscaler_role_arn = module.iam_irsa_dr.cluster_autoscaler_role_arn
+  secrets_store_csi_role_arn  = module.iam_irsa_dr.secrets_store_csi_role_arn
+
+  depends_on = [module.eks_dr, module.iam_irsa_dr]
+}
+
+# ==============================================
+# DR Aurora SG — EKS auto-created node SG rule (us-west-2)
+# ==============================================
+# Same fix as primary (aurora_allow_eks_nodes): the DR EKS cluster auto-creates
+# a node SG that must be allowed to reach the DR Aurora secondary on 5432.
+# Without this, DR pods get connection timeouts to the DR database.
+# ==============================================
+resource "aws_security_group_rule" "dr_aurora_allow_eks_nodes" {
+  provider = aws.dr
+
+  type                     = "ingress"
+  description              = "PostgreSQL from DR EKS auto-created node SG"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = module.networking_dr.aurora_sg_id
+  source_security_group_id = module.eks_dr.node_security_group_id
+
+  depends_on = [module.networking_dr, module.eks_dr]
 }
 
 # Wire DR networking into Aurora module
