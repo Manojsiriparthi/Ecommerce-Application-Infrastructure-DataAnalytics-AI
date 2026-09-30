@@ -66,14 +66,12 @@ module "eks" {
   workers_desired      = 3    # one node per AZ (us-east-1a, 1b, 1c)
   workers_min          = 3
   workers_max          = 6
-  worker_disk_size     = 25   # 25GB root volume per worker
 
   # Public nodes — t3.micro (1 vCPU, ALB support only, no application pods)
   public_node_instance_type = var.public_node_instance_type
   public_desired            = 1
   public_min                = 1
   public_max                = 3
-  public_disk_size          = 20   # 20GB — EKS AMI snapshot minimum (can't go lower)
 
   # DB nodes — disabled: Aurora is AWS-managed
   create_db_nodes = false
@@ -355,14 +353,12 @@ module "eks_dr" {
   workers_desired      = 3
   workers_min          = 3
   workers_max          = 6
-  worker_disk_size     = 25   # 25GB root volume per worker
 
   # Public node — needed for ALB ip-mode target routing (same as primary)
   public_node_instance_type = "t3.micro"
   public_desired            = 1
   public_min                = 1
   public_max                = 3
-  public_disk_size          = 20   # 20GB — EKS AMI snapshot minimum (can't go lower)
 
   create_db_nodes = false
 

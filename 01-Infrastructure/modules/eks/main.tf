@@ -79,17 +79,8 @@ resource "aws_launch_template" "workers" {
   name_prefix = "${var.project_name}-workers-"
   # instance_type is NOT set here — set in node group instance_types instead
   # Setting it in both causes: "Cannot specify instance types in launch template and API request"
-
-  # Root EBS volume — sized via worker_disk_size (default 25GB)
-  block_device_mappings {
-    device_name = "/dev/xvda"
-    ebs {
-      volume_size           = var.worker_disk_size
-      volume_type           = "gp3"
-      delete_on_termination = true
-      encrypted             = true
-    }
-  }
+  # NOTE: no block_device_mappings — nodes use the EKS default disk (20GB).
+  # Adding disk size here forces a node replacement that can fail; left default.
 
   tag_specifications {
     resource_type = "instance"
@@ -181,17 +172,7 @@ resource "aws_eks_node_group" "public" {
 resource "aws_launch_template" "public" {
   name_prefix = "${var.project_name}-public-"
   # instance_type NOT set here — controlled by node group instance_types
-
-  # Root EBS volume — sized via public_disk_size (default 15GB, smaller — no app pods)
-  block_device_mappings {
-    device_name = "/dev/xvda"
-    ebs {
-      volume_size           = var.public_disk_size
-      volume_type           = "gp3"
-      delete_on_termination = true
-      encrypted             = true
-    }
-  }
+  # NOTE: no block_device_mappings — nodes use the EKS default disk (20GB).
 
   tag_specifications {
     resource_type = "instance"

@@ -60,6 +60,15 @@ resource "aws_rds_cluster" "secondary" {
   kms_key_id          = var.dr_kms_key_arn != "" ? var.dr_kms_key_arn : aws_kms_key.dr_aurora[0].arn
   skip_final_snapshot = true
 
+  # CRITICAL: the secondary can only start physical replication AFTER the
+  # primary cluster + its writer instance are fully available. Without this
+  # dependency the secondary races ahead and fails with
+  # "Source cluster is in a state which is not valid for physical replication".
+  depends_on = [
+    aws_rds_cluster.primary,
+    aws_rds_cluster_instance.writer,
+  ]
+
   lifecycle {
     ignore_changes = [engine_version]
   }
