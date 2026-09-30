@@ -80,13 +80,18 @@ resource "aws_kms_key" "main" {
       # Explicitly allow the services IRSA role to decrypt secrets
       # This is required even though root account has access above —
       # KMS evaluates both the key policy AND the IAM policy.
-      # The root statement allows IAM delegation but the specific role
-      # must also be explicitly listed for Secrets Manager decryption.
+      # Allow the IRSA roles (services-role, secrets-store-csi-role) to decrypt.
+      # WHY Principal = account root + ArnLike condition (not the role ARN directly):
+      #   On a fresh build, the security module runs BEFORE iam-irsa creates those
+      #   roles. KMS rejects a policy that names a principal ARN that doesn't exist
+      #   yet ("invalid principals"). Using the account root as principal + an
+      #   ArnLike condition on aws:PrincipalArn lets the policy be created NOW and
+      #   still grants ONLY those roles once they exist. Wildcards match future roles.
       {
-        Sid    = "AllowServicesRoleDecrypt"
+        Sid    = "AllowIRSARolesDecrypt"
         Effect = "Allow"
         Principal = {
-          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-services-role"
+          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:root"
         }
         Action = [
           "kms:Decrypt",
@@ -94,20 +99,14 @@ resource "aws_kms_key" "main" {
           "kms:DescribeKey"
         ]
         Resource = "*"
-      },
-      # Allow secrets-store-csi-driver role to decrypt
-      {
-        Sid    = "AllowCSIDriverDecrypt"
-        Effect = "Allow"
-        Principal = {
-          AWS = "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-secrets-store-csi-role"
+        Condition = {
+          ArnLike = {
+            "aws:PrincipalArn" = [
+              "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-services-role",
+              "arn:aws:iam::${data.aws_caller_identity.security.account_id}:role/${var.project_name}-secrets-store-csi-role"
+            ]
+          }
         }
-        Action = [
-          "kms:Decrypt",
-          "kms:GenerateDataKey",
-          "kms:DescribeKey"
-        ]
-        Resource = "*"
       }
     ]
   })
