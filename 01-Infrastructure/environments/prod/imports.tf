@@ -1,30 +1,16 @@
 # =============================================================================
-# Terraform Import Blocks (Terraform 1.5+)
+# Terraform Import Blocks — INTENTIONALLY EMPTY
 # =============================================================================
-# These import blocks were used to ADOPT CloudWatch log groups that survived a
-# previous `terraform destroy` (AWS keeps log groups by design).
+# Previously this file held commented-out import blocks used to adopt
+# CloudWatch log groups that survive `terraform destroy` (AWS keeps them by
+# design). That approach was fragile: the imports fail if the log groups DON'T
+# exist, and must be toggled by hand depending on state — exactly the manual
+# toil we want gone.
 #
-# They are DISABLED right now because the infrastructure was fully destroyed —
-# the log groups no longer exist, so importing them fails with
-# "Cannot import non-existent remote object". On a fresh build, Terraform
-# CREATES the log groups normally (no import needed).
+# REPLACED BY: 06-Scripts/00-pre-apply-cleanup.sh
+#   Run that script before re-applying after a destroy. It DELETES the surviving
+#   log groups (and other survivors) in both regions, so `terraform apply` then
+#   CREATES them fresh with zero "already exists" errors and zero imports.
 #
-# WHEN TO RE-ENABLE:
-#   If you later `terraform destroy` and the log groups survive, then on the
-#   next apply you'll get "ResourceAlreadyExistsException". At THAT point,
-#   uncomment the import blocks below to adopt the surviving log groups.
-#
-# import {
-#   to = module.security.aws_cloudwatch_log_group.vpc_flow_logs
-#   id = "/aws/vpc/flowlogs/pip-project-ecommerce-prod"
-# }
-#
-# import {
-#   to = module.security.aws_cloudwatch_log_group.app_logs
-#   id = "/aws/eks/pip-project-ecommerce-prod/application"
-# }
-#
-# import {
-#   to = module.security.aws_cloudwatch_log_group.infra_logs
-#   id = "/aws/eks/pip-project-ecommerce-prod/infrastructure"
-# }
+# Keep this file empty (no import blocks) so applies are deterministic.
+# =============================================================================

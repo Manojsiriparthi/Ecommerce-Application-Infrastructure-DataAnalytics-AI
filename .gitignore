@@ -13,3 +13,7 @@
 *.crash.log
 override.tf
 override.tf.json
+
+# Rendered K8s manifests (deploy script fills placeholders into these temp
+# files per-region; the source .yaml keeps its <PLACEHOLDER> tokens).
+**/*.rendered.yaml

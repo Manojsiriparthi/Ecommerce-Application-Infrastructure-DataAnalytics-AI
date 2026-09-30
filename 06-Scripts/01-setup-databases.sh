@@ -89,27 +89,37 @@ header "Step 2: Fetching DB endpoint from AWS"
 #   Steps 3 creates databases using a psql pod inside the cluster.
 #   That pod needs the RDS host + master credentials — we pass them as env vars.
 
-info "Fetching RDS Writer endpoint from SSM / Aurora API..."
-DB_HOST=$(aws ssm get-parameter \
-  --name "/${PROJECT}/${ENV}/rds/proxy-endpoint" \
-  --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+# IMPORTANT — use the Aurora WRITER endpoint, NOT the RDS Proxy.
+#   The RDS Proxy rejects Prisma's TLS handshake on Aurora PostgreSQL 17
+#   (Prisma error P1001 "Can't reach database server"). psql via the proxy
+#   also intermittently fails. Both CREATE DATABASE (Step 3) and Prisma
+#   migrations (Step 4) work reliably against the writer endpoint, so we
+#   resolve the WRITER first and only fall back to proxy/SSM if unavailable.
+info "Fetching Aurora WRITER endpoint (preferred for DDL + Prisma)..."
+DB_HOST=$(aws rds describe-db-clusters \
+  --db-cluster-identifier "${PROJECT}-cluster" \
+  --region "$REGION" \
+  --query "DBClusters[0].Endpoint" --output text 2>/dev/null || echo "")
 
+# Fallback 1: writer endpoint saved in SSM by Terraform
+if [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]]; then
+  DB_HOST=$(aws ssm get-parameter \
+    --name "/${PROJECT}/${ENV}/rds/writer-endpoint" \
+    --region "$REGION" --query Parameter.Value --output text 2>/dev/null || echo "")
+fi
+
+# Fallback 2 (LAST resort): proxy endpoint — may fail Prisma TLS, warn loudly
 if [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]]; then
   DB_HOST=$(aws rds describe-db-proxies \
     --db-proxy-name "${PROJECT}-proxy" \
     --region "$REGION" \
     --query "DBProxies[0].Endpoint" --output text 2>/dev/null || echo "")
-fi
-
-if [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]]; then
-  DB_HOST=$(aws rds describe-db-clusters \
-    --db-cluster-identifier "${PROJECT}-cluster" \
-    --region "$REGION" \
-    --query "DBClusters[0].Endpoint" --output text 2>/dev/null || echo "")
+  [[ -n "$DB_HOST" && "$DB_HOST" != "None" ]] && \
+    warn "Falling back to RDS Proxy endpoint — Prisma may fail TLS (P1001). Prefer the writer."
 fi
 
 [[ -z "$DB_HOST" || "$DB_HOST" == "None" ]] && fail "Could not find DB endpoint. Is Aurora running?"
-success "DB Host: $DB_HOST"
+success "DB Host (writer): $DB_HOST"
 
 info "Fetching master credentials from Secrets Manager..."
 SECRET=$(aws secretsmanager get-secret-value \
@@ -312,6 +322,81 @@ if [[ ${#MIGRATION_FAILED[@]} -gt 0 ]]; then
 else
   success "All 5 service migrations completed successfully"
 fi
+
+# ── Step 4b: Seed product catalog (automated — no manual node one-liner) ──────
+header "Step 4b: Seeding product catalog"
+
+# WHY: the storefront is empty without products. product-service ships a seed
+# script (npm run seed → tsx prisma/seed.ts). We run it as a one-off pod using
+# the product-service image, with the same IRSA + SecretProviderClass so it
+# gets product-db-url automatically. Idempotent seeds are safe to re-run;
+# this replaces the manual `node -e "new PrismaClient()..."` step.
+SEED_POD="seed-product-service"
+SEED_IMAGE="${ECR_REGISTRY}/${PROJECT}/product-service:latest"
+
+kubectl delete pod "$SEED_POD" -n ecommerce --ignore-not-found --wait=false 2>/dev/null || true
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${SEED_POD}
+  namespace: ecommerce
+  labels:
+    app: db-seed
+    service: product-service
+spec:
+  restartPolicy: Never
+  serviceAccountName: ecommerce-services-sa
+  volumes:
+  - name: aws-secrets
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: "product-service-secrets"
+  containers:
+  - name: seed
+    image: ${SEED_IMAGE}
+    imagePullPolicy: Always
+    # Try npm run seed; if the script isn't present in the image, don't hard-fail.
+    command: ["sh", "-c", "npm run seed || echo 'SEED_SKIPPED: no seed script in image'"]
+    volumeMounts:
+    - name: aws-secrets
+      mountPath: /mnt/secrets
+      readOnly: true
+    env:
+    - name: NODE_ENV
+      value: "production"
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: product-db-url
+          key: database_url
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "300m"
+EOF
+
+info "Waiting for seed pod (timeout: 2m)..."
+if kubectl wait pod "$SEED_POD" -n ecommerce \
+  --for=condition=Ready --timeout=60s 2>/dev/null; then
+  kubectl wait pod "$SEED_POD" -n ecommerce \
+    --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s 2>/dev/null || true
+fi
+echo -e "${BOLD}  ── product-service seed logs ──${NC}"
+kubectl logs "$SEED_POD" -n ecommerce 2>/dev/null || echo "  (no logs)"
+SEED_PHASE=$(kubectl get pod "$SEED_POD" -n ecommerce -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+if [[ "$SEED_PHASE" == "Succeeded" ]]; then
+  success "Product catalog seeded (or seed was idempotent)"
+else
+  warn "Seed pod phase: $SEED_PHASE — storefront may be empty; check logs above"
+fi
+kubectl delete pod "$SEED_POD" -n ecommerce --ignore-not-found 2>/dev/null || true
 
 # ── Step 5: Verify tables exist in RDS ───────────────────────────────────────
 header "Step 5: Verifying tables exist inside RDS"

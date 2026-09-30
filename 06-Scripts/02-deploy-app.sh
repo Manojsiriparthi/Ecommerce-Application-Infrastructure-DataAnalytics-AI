@@ -156,8 +156,18 @@ if [[ "$ACTION" == "deploy" ]]; then
   # ── Phase 4: Patch K8s placeholders ─────────────────────────────────────
   header "Phase 4: Patch K8s manifests"
 
+  # IRSA roles are OIDC-bound PER CLUSTER. Each EKS cluster has its own OIDC
+  # provider, so the DR (us-west-2) cluster needs its OWN role whose trust
+  # policy trusts the DR OIDC issuer. Using the primary role in DR causes:
+  #   AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity
+  # The DR IRSA module creates roles named "${PROJECT}-dr-services-role".
+  if [[ "$REGION" == "us-west-2" ]]; then
+    SERVICES_ROLE_NAME="${PROJECT}-dr-services-role"
+  else
+    SERVICES_ROLE_NAME="${PROJECT}-services-role"
+  fi
   IRSA_ROLE_ARN=$(aws iam get-role \
-    --role-name "${PROJECT}-services-role" \
+    --role-name "$SERVICES_ROLE_NAME" \
     --query "Role.Arn" --output text 2>/dev/null || echo "")
   REDIS_HOST=$(ssm "redis/primary-endpoint")
   SNS_TOPIC=$(aws sns list-topics --region "$REGION" \
@@ -196,25 +206,46 @@ if [[ "$ACTION" == "deploy" ]]; then
     sed -i "s|image:.*${PROJECT}/${SVC}:.*|image: ${IMAGE}|g" "$DEPLOY"
   done
 
-  # Patch ServiceAccount IRSA
-  [[ -n "$IRSA_ROLE_ARN" ]] && \
-    sed -i "s|<IRSA_ROLE_ARN>|${IRSA_ROLE_ARN}|g" \
-      "$K8S/secrets/serviceaccount.yaml" 2>/dev/null || true
+  # Patch ServiceAccount IRSA — render to a TEMP file so the source keeps its
+  # <IRSA_ROLE_ARN> placeholder. This makes the deploy idempotent and lets the
+  # SAME repo deploy to either region with the correct per-region role:
+  #   - us-east-1 → pip-project-ecommerce-services-role
+  #   - us-west-2 → pip-project-ecommerce-dr-services-role   (selected above)
+  # If we sed the source in place, the primary ARN gets burned in and a later
+  # DR deploy silently re-applies the WRONG role (causes AssumeRoleWithWebIdentity
+  # AccessDenied on DR pods, and any manual `kubectl annotate` gets overwritten).
+  SA_RENDERED="$K8S/secrets/serviceaccount.rendered.yaml"
+  if [[ -n "$IRSA_ROLE_ARN" ]]; then
+    sed "s|<IRSA_ROLE_ARN>|${IRSA_ROLE_ARN}|g" \
+      "$K8S/secrets/serviceaccount.yaml" > "$SA_RENDERED"
+    info "  ServiceAccount role → $SERVICES_ROLE_NAME ($IRSA_ROLE_ARN)"
+  else
+    fail "Could not resolve IRSA role '$SERVICES_ROLE_NAME'. Is the IRSA module applied for region $REGION?"
+  fi
 
-  # Patch external ingress
-  EI="$K8S/frontend/ingress.yaml"
-  [[ -n "$WAF_ARN"     ]] && sed -i "s|<WAF_WEBACL_ARN>|${WAF_ARN}|g"         "$EI"
-  [[ -n "$LOGS_BUCKET" ]] && sed -i "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g"   "$EI"
-  [[ -n "$PUB1" ]] && sed -i "s|<PUBLIC_SUBNET_ID_1>|${PUB1}|g" "$EI"
-  [[ -n "$PUB2" ]] && sed -i "s|<PUBLIC_SUBNET_ID_2>|${PUB2}|g" "$EI"
-  [[ -n "$PUB3" ]] && sed -i "s|<PUBLIC_SUBNET_ID_3>|${PUB3}|g" "$EI"
+  # Patch ingresses — render to TEMP files so the SOURCE keeps its placeholders.
+  # CRITICAL for multi-region: subnet IDs are region-specific. If we sed the
+  # source in place, the FIRST region's subnet IDs get burned into the file, and
+  # a later deploy to the OTHER region re-applies those wrong (non-existent in
+  # that region) subnet IDs → "InvalidSubnetID.NotFound" and the ALB never
+  # provisions. The subnet vars ($PUB*/$PRIV*) are already queried per-region
+  # via `--region "$REGION"` above, so rendering fresh each run stays correct.
+  EI="$K8S/frontend/ingress.rendered.yaml"
+  sed -e "s|<WAF_WEBACL_ARN>|${WAF_ARN}|g" \
+      -e "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g" \
+      -e "s|<PUBLIC_SUBNET_ID_1>|${PUB1}|g" \
+      -e "s|<PUBLIC_SUBNET_ID_2>|${PUB2}|g" \
+      -e "s|<PUBLIC_SUBNET_ID_3>|${PUB3}|g" \
+      "$K8S/frontend/ingress.yaml" > "$EI"
 
-  # Patch internal ingress
-  II="$K8S/services/ingress-internal.yaml"
-  [[ -n "$LOGS_BUCKET" ]] && sed -i "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g"   "$II"
-  [[ -n "$PRIV1" ]] && sed -i "s|<PRIVATE_SUBNET_ID_1>|${PRIV1}|g" "$II"
-  [[ -n "$PRIV2" ]] && sed -i "s|<PRIVATE_SUBNET_ID_2>|${PRIV2}|g" "$II"
-  [[ -n "$PRIV3" ]] && sed -i "s|<PRIVATE_SUBNET_ID_3>|${PRIV3}|g" "$II"
+  II="$K8S/services/ingress-internal.rendered.yaml"
+  sed -e "s|<LOGS_BUCKET_NAME>|${LOGS_BUCKET}|g" \
+      -e "s|<PRIVATE_SUBNET_ID_1>|${PRIV1}|g" \
+      -e "s|<PRIVATE_SUBNET_ID_2>|${PRIV2}|g" \
+      -e "s|<PRIVATE_SUBNET_ID_3>|${PRIV3}|g" \
+      "$K8S/services/ingress-internal.yaml" > "$II"
+
+  info "  Ingress subnets ($REGION) → public: $PUB1,$PUB2,$PUB3 | private: $PRIV1,$PRIV2,$PRIV3"
 
   # Fix SecretProviderClass env path (dev → prod)
   sed -i "s|/dev/db/|/prod/db/|g;s|/dev/app/|/prod/app/|g;s|/dev/redis/|/prod/redis/|g" \
@@ -226,7 +257,8 @@ if [[ "$ACTION" == "deploy" ]]; then
   header "Phase 5: Deploy to EKS"
 
   kubectl apply -f "$K8S/namespace.yaml"
-  kubectl apply -f "$K8S/secrets/serviceaccount.yaml"
+  # Apply the RENDERED ServiceAccount (has the correct per-region role ARN baked in)
+  kubectl apply -f "$SA_RENDERED"
   kubectl apply -f "$K8S/secrets/secretproviderclass-db.yaml"
 
   # Check if ConfigMap already exists with a real internal ALB DNS
@@ -262,13 +294,13 @@ if [[ "$ACTION" == "deploy" ]]; then
     kubectl apply -f "$K8S/services/$SVC/service.yaml"
     kubectl apply -f "$K8S/services/$SVC/deployment.yaml"
   done
-  kubectl apply -f "$K8S/services/ingress-internal.yaml"
+  kubectl apply -f "$II"   # rendered internal ingress (region-correct private subnets)
 
   # ── Do NOT deploy frontend yet — wait for internal ALB first (Phase 6b) ──
   # Frontend pod reads INTERNAL_API_URL from ConfigMap at startup.
   # We need the real ALB DNS in ConfigMap BEFORE the frontend pod starts.
   kubectl apply -f "$K8S/frontend/service.yaml"
-  kubectl apply -f "$K8S/frontend/ingress.yaml"  # external ALB can start provisioning
+  kubectl apply -f "$EI"  # rendered external ingress (region-correct public subnets)
 
   success "Backend manifests applied — waiting for internal ALB before starting frontend"
 

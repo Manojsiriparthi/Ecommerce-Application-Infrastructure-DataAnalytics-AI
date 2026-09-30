@@ -27,6 +27,13 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // EXCEPTION: /api/region is a LOCAL frontend route (app/api/region/route.ts).
+  // It reports which AWS region THIS pod runs in (DR failover visibility), so
+  // it must NOT be proxied to the backend — let Next.js handle it locally.
+  if (pathname === '/api/region') {
+    return NextResponse.next();
+  }
+
   const internalApiUrl = process.env.INTERNAL_API_URL;
 
   if (!internalApiUrl) {

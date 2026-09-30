@@ -206,3 +206,19 @@ variable "dr_alb_dns_name" {
   type    = string
   default = ""
 }
+
+# ==============================================
+# ALB auto-discovery toggle (see alb-discovery.tf)
+# ==============================================
+variable "discover_alb_from_ingress" {
+  description = <<-EOT
+    When true, Route53 reads the live external ALB hostname from the Kubernetes
+    ingress in each region (auto-follows a rebuilt ALB — no manual tfvars edit).
+    Leave FALSE on the very first apply (no cluster/app yet), then set TRUE for
+    re-applies after the app is deployed.
+      Fresh build : false → uses alb_dns_name / dr_alb_dns_name from tfvars
+      Re-apply    : true  → auto-discovers current ALBs from the ingress
+  EOT
+  type        = bool
+  default     = false
+}

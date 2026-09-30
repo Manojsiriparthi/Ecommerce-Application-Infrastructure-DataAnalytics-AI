@@ -92,3 +92,23 @@ resource "aws_ssm_parameter" "db_url" {
     Environment = var.environment
   }
 }
+
+# ==============================================
+# Writer endpoint in SSM — used by 06-Scripts/01-setup-databases.sh
+# ==============================================
+# The setup script resolves the DB host for CREATE DATABASE + Prisma migrations.
+# It prefers `aws rds describe-db-clusters`, but this SSM param is a stable
+# fallback and a single source of truth. WRITER endpoint (not proxy) because
+# Prisma/psql work reliably against it (see db_url resource above).
+resource "aws_ssm_parameter" "writer_endpoint" {
+  name        = "/${var.project_name}/${var.environment}/rds/writer-endpoint"
+  type        = "String"
+  value       = aws_rds_cluster.primary.endpoint
+  description = "Aurora writer endpoint (used by DB setup script for DDL + migrations)"
+  overwrite   = true
+
+  tags = {
+    Name        = "${var.project_name}-writer-endpoint-param"
+    Environment = var.environment
+  }
+}

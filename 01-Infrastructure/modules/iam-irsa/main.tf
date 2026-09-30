@@ -223,9 +223,16 @@ resource "aws_iam_policy" "ecommerce_services" {
           "secretsmanager:GetSecretValue",
           "secretsmanager:DescribeSecret"
         ]
+        # Include BOTH var.project_name AND the base "pip-project-ecommerce".
+        # For the DR module, var.project_name is "pip-project-ecommerce-dr", but
+        # the secrets are named with the base "pip-project-ecommerce/prod/..."
+        # (same names, replicated to the DR region). Without the base-name ARN,
+        # DR pods get AccessDeniedException on secretsmanager:GetSecretValue.
         Resource = [
           "arn:aws:secretsmanager:*:*:secret:${var.project_name}-*",
-          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*"
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*",
+          "arn:aws:secretsmanager:*:*:secret:pip-project-ecommerce-*",
+          "arn:aws:secretsmanager:*:*:secret:pip-project-ecommerce/*"
         ]
       },
       # ---- SSM Parameter Store ----
@@ -254,9 +261,13 @@ resource "aws_iam_policy" "ecommerce_services" {
         Resource = "*"
         Condition = {
           StringLike = {
+            # sns added: publishing to a KMS-encrypted SNS topic calls
+            # kms:GenerateDataKey VIA sns.amazonaws.com. Without this, login
+            # (which publishes USER_LOGIN_SUCCESS) fails with KMSAccessDenied.
             "kms:ViaService" = [
               "secretsmanager.*.amazonaws.com",
-              "ssm.*.amazonaws.com"
+              "ssm.*.amazonaws.com",
+              "sns.*.amazonaws.com"
             ]
           }
         }
@@ -347,9 +358,14 @@ resource "aws_iam_policy" "secrets_store_csi_policy" {
           "secretsmanager:GetSecretValue",
           "secretsmanager:DescribeSecret"
         ]
+        # Base-name ARNs included so the DR CSI role (var.project_name =
+        # "pip-project-ecommerce-dr") can still read "pip-project-ecommerce/..."
+        # secrets replicated into the DR region.
         Resource = [
           "arn:aws:secretsmanager:*:*:secret:${var.project_name}-*",
-          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*"
+          "arn:aws:secretsmanager:*:*:secret:${var.project_name}/*",
+          "arn:aws:secretsmanager:*:*:secret:pip-project-ecommerce-*",
+          "arn:aws:secretsmanager:*:*:secret:pip-project-ecommerce/*"
         ]
       },
       {

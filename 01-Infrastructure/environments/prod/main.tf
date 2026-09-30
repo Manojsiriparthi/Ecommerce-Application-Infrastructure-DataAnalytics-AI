@@ -220,13 +220,16 @@ module "route53_acm" {
   project_name = "pip-project-ecommerce"
   environment  = var.environment
   domain_name  = var.domain_name
-  alb_dns_name = var.alb_dns_name
-  alb_zone_id  = var.alb_dns_name != "" ? "Z35SXDOTRQ7X7K" : ""
+  # effective_* auto-discovers the LIVE ALB hostname from the K8s ingress
+  # (see alb-discovery.tf), falling back to the tfvars value. This stops the
+  # stale-hostname bug where a rebuilt ALB left Route53 pointing at a dead name.
+  alb_dns_name = local.effective_alb_dns_name
+  alb_zone_id  = local.effective_alb_dns_name != "" ? "Z35SXDOTRQ7X7K" : ""
 
-  # DR failover — when dr_alb_dns_name is set, Route53 creates PRIMARY/SECONDARY
+  # DR failover — when the DR ALB exists, Route53 creates PRIMARY/SECONDARY
   # failover records with a health check on the primary ALB.
   # us-west-2 ALB hosted zone ID = Z1H1FL5HABSF5
-  dr_alb_dns_name = var.dr_alb_dns_name
+  dr_alb_dns_name = local.effective_dr_alb_dns_name
   dr_alb_zone_id  = "Z1H1FL5HABSF5"
   sns_topic_arn   = module.messaging.sns_topic_arn
 
