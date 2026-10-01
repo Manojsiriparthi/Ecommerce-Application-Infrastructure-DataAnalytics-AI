@@ -257,8 +257,14 @@ resource "aws_route53_record" "apex_primary" {
   health_check_id = aws_route53_health_check.primary[0].id
 
   alias {
-    name                   = var.alb_dns_name
-    zone_id                = var.alb_zone_id
+    name    = var.alb_dns_name
+    zone_id = var.alb_zone_id
+    # TRUE so Route53 ALSO watches the ALB's target health. This makes a
+    # realistic "scale frontend to 0" trigger work: with no healthy targets
+    # behind the ALB, Route53 marks the primary record unhealthy and fails
+    # over to the DR SECONDARY record. (The explicit health_check_id below is
+    # a secondary signal — it pings the ALB and can stay green on the 301
+    # redirect, so target-health is the reliable failover driver here.)
     evaluate_target_health = true
   }
 
@@ -305,8 +311,9 @@ resource "aws_route53_record" "www_primary" {
   health_check_id = aws_route53_health_check.primary[0].id
 
   alias {
-    name                   = var.alb_dns_name
-    zone_id                = var.alb_zone_id
+    name    = var.alb_dns_name
+    zone_id = var.alb_zone_id
+    # true — see apex_primary: target-health drives the scale-to-0 failover demo.
     evaluate_target_health = true
   }
 }

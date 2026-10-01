@@ -24,7 +24,9 @@
 12. [draw.io Diagram Prompt](#12-drawio-diagram-prompt)
 
 ---
-<video controls src="WhatsApp Video 2026-09-29 at 01.46.43.mp4" title="Title"></video>
+
+![alt text](<WhatsApp Image 2026-09-29 at 00.13.52.jpeg>)
+
 ## 1. What We Are Building
 
 We are building an **e-commerce web application** that allows users to browse products, add items to a cart, make payments, and receive order notifications.
