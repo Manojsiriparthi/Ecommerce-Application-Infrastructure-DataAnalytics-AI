@@ -65,6 +65,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
     id     = "waf-alb-logs-lifecycle"
     status = "Enabled"
 
+    # AWS provider 6.x requires an explicit filter or prefix on each rule.
+    # Empty filter {} = apply to ALL objects in the bucket (previous default).
+    filter {}
+
     transition {
       days          = var.log_transition_days
       storage_class = "GLACIER"
