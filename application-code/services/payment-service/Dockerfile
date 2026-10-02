@@ -24,6 +24,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=4005
 
+
+# Security upgrade: update OpenSSL
+RUN apk update \
+    && apk upgrade openssl \
+    && rm -rf /var/cache/apk/*
+
 RUN addgroup --system --gid 1001 nodejs \
     && adduser --system --uid 1001 appuser
 
