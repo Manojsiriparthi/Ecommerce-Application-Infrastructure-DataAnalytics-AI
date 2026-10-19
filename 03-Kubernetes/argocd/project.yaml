@@ -1,0 +1,105 @@
+# =============================================================================
+# ArgoCD AppProject — pip-project-ecommerce
+# =============================================================================
+# WHY AN APPPROJECT:
+#   An AppProject is ArgoCD's RBAC boundary. It defines:
+#     - Which git repositories this project can deploy FROM
+#     - Which Kubernetes clusters it can deploy TO
+#     - Which namespaces it can create resources IN
+#     - Which Kubernetes resource kinds are allowed/denied
+#
+#   Without this, the default project allows everything — not acceptable
+#   for production. This project scopes ArgoCD to exactly the resources
+#   this application needs.
+#
+# SECURITY:
+#   - Source: only this repo (no other repos can be registered to this project)
+#   - Destination: only the local EKS cluster, only the ecommerce namespace
+#   - Denied: ClusterRoles, PersistentVolumes, StorageClasses (infra-level
+#     resources are managed by Terraform, not ArgoCD)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: pip-project-ecommerce
+  namespace: argocd
+  # Prevent accidental deletion of this project
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "pip-project-ecommerce — EKS production deployment"
+
+  # Only deploy from this repository
+  # Replace <GITHUB_ORG>/<REPO> with your actual GitHub path
+  sourceRepos:
+    - "https://github.com/<GITHUB_ORG>/<REPO>.git"
+
+  # Only deploy to the local EKS cluster, ecommerce namespace
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: ecommerce
+    # Allow ArgoCD to manage its own namespace (for notifications etc.)
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # Allow all standard namespaced resource kinds
+  # Deny cluster-level resources — those are managed by Terraform
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace           # Only allow namespace creation
+
+  namespaceResourceBlacklist:
+    # ArgoCD must NOT touch these — they are managed by Terraform/EKS
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "storage.k8s.io"
+      kind: StorageClass
+    - group: ""
+      kind: PersistentVolume
+
+  # Permit all standard namespaced resources
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: "apps"
+      kind: StatefulSet
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "secrets-store.csi.x-k8s.io"
+      kind: SecretProviderClass
+    - group: ""
+      kind: ServiceAccount
+
+  # Sync windows — prevent uncontrolled deployments during business hours in prod
+  # Remove or adjust for dev. Prod: only allow sync outside peak hours.
+  syncWindows:
+    - kind: allow
+      schedule: "0 20 * * *"    # Allow syncs from 20:00 UTC daily
+      duration: 8h               # Window open for 8 hours (20:00-04:00 UTC)
+      applications:
+        - "*"
+      manualSync: true           # Always allow manual sync regardless of window
+
+  # Roles — read-only for developers, full access for CI/CD
+  roles:
+    - name: ci-deployer
+      description: "Jenkins CI pipeline — can sync and update images"
+      policies:
+        - "p, proj:pip-project-ecommerce:ci-deployer, applications, get,    pip-project-ecommerce/*, allow"
+        - "p, proj:pip-project-ecommerce:ci-deployer, applications, sync,   pip-project-ecommerce/*, allow"
+        - "p, proj:pip-project-ecommerce:ci-deployer, applications, update, pip-project-ecommerce/*, allow"
+      jwtTokens: []
+
+    - name: developer
+      description: "Read-only access for developers"
+      policies:
+        - "p, proj:pip-project-ecommerce:developer, applications, get, pip-project-ecommerce/*, allow"
+      jwtTokens: []

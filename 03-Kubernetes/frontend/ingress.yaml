@@ -1,0 +1,78 @@
+# ==============================================
+# External ALB Ingress — internet-facing
+# Traffic path: Internet → WAF → this ALB → frontend pods
+#
+# NO HOST RULES: Works with ALB DNS directly (no domain needed).
+# When domain is registered, add host rules and ACM cert annotation.
+#
+# SUBNET IDs: Patched automatically by 02-deploy-app.sh from AWS
+# PUBLIC_SUBNET tags. Do not hardcode here.
+# ==============================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend-external-ingress
+  namespace: ecommerce
+  labels:
+    app: frontend
+    tier: presentation
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # HTTP only — no TLS until domain + ACM cert are ready
+    # To add HTTPS after domain registration:
+    #   alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN from SSM>"
+    #   alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    #   alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # WAF — attach after domain + cert are configured
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "<WAF_ARN from SSM>"
+
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Group — shares one ALB
+    alb.ingress.kubernetes.io/group.name: external-alb-group
+    alb.ingress.kubernetes.io/group.order: "10"
+
+    # Subnets — replaced by deploy script with real subnet IDs
+    alb.ingress.kubernetes.io/subnets: "<PUBLIC_SUBNET_ID_1>,<PUBLIC_SUBNET_ID_2>,<PUBLIC_SUBNET_ID_3>"
+
+    # ALB attributes
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      idle_timeout.timeout_seconds=60,
+      routing.http2.enabled=true,
+      deletion_protection.enabled=false
+
+    # Stickiness
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      stickiness.enabled=true,
+      stickiness.lb_cookie.duration_seconds=86400,
+      stickiness.type=lb_cookie,
+      deregistration_delay.timeout_seconds=30
+
+    alb.ingress.kubernetes.io/tags: "Environment=prod,Project=pip-project-ecommerce,ManagedBy=terraform"
+
+spec:
+  ingressClassName: alb
+  # No host rules — works with ALB DNS directly
+  # Add host rules when domain is registered:
+  #   rules:
+  #   - host: ecommerce-pip.com
+  #     http: ...
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
