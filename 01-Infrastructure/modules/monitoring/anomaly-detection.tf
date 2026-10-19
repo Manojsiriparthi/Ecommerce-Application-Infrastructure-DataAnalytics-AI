@@ -149,7 +149,36 @@ resource "aws_cloudwatch_metric_alarm" "aurora_connections_anomaly" {
 # RUBRIC: Implement log retention — application logs 30 days, audit logs 90 days
 # =============================================================================
 
-# Application logs — 30 days (pod stdout/stderr via Fluent Bit)
+# -----------------------------------------------------------------------------
+# EKS Control Plane logs — 90 days
+# -----------------------------------------------------------------------------
+# EKS writes ALL enabled_cluster_log_types into one log group:
+#   /aws/eks/<cluster-name>/cluster
+#
+# Log streams inside that group (one per log type):
+#   kube-apiserver-*       — every API request (who called what, 4xx/5xx)
+#   kube-audit-*           — full RBAC audit trail (who changed what resource)
+#   authenticator-*        — IAM→K8s identity (debug "Unauthorized" 401s here)
+#   kube-controller-manager-* — replica reconciliation, scheduling decisions
+#   kube-scheduler-*       — which node a pod landed on and why
+#
+# Without this resource, AWS creates the log group with NO retention policy
+# (logs kept forever = unbounded cost). This pins it to 90 days.
+# -----------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "eks_control_plane" {
+  # Name MUST match exactly what EKS auto-creates — do not change this format
+  name              = "/aws/eks/${var.project_name}-cluster/cluster"
+  retention_in_days = 90   # Control plane / audit: 90 days
+
+  tags = {
+    Name          = "${var.project_name}-eks-control-plane-logs"
+    Environment   = var.environment
+    LogType       = "control-plane"
+    RetentionDays = "90"
+  }
+}
+
+
 resource "aws_cloudwatch_log_group" "service_logs" {
   for_each = toset([
     "user-service",

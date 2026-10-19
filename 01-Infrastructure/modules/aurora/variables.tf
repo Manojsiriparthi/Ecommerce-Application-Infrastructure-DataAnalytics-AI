@@ -209,9 +209,38 @@ variable "dr_kms_key_arn" {
 }
 
 variable "dr_reader_count" {
-  description = "Number of reader instances in DR secondary cluster"
+  description = <<-EOT
+    Number of reader instances in the DR secondary cluster.
+    Set to 2 (same as primary) so the DR cluster also has cross-AZ read HA.
+    During a real failover you want the DR cluster to be fully sized and
+    ready — not bootstrapping readers while traffic is already hitting it.
+  EOT
   type        = number
-  default     = 1
+  default     = 2
+}
+
+variable "availability_zones" {
+  description = <<-EOT
+    Ordered list of AZs for the Aurora cluster.
+    Writer  → AZ[0]
+    Reader1 → AZ[1]
+    Reader2 → AZ[2]
+    Pass var.azs from the environment (same AZs used by VPC subnets).
+    If left empty, AWS places instances automatically (cross-AZ NOT guaranteed).
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "dr_availability_zones" {
+  description = <<-EOT
+    Ordered list of AZs in the DR region for the secondary Aurora cluster readers.
+    Pass var.dr_azs from the environment.
+    Reader-0 → DR AZ[0], Reader-1 → DR AZ[1].
+    If empty, AWS places DR readers automatically.
+  EOT
+  type        = list(string)
+  default     = []
 }
 
 

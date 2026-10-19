@@ -22,3 +22,23 @@ output "secrets_store_csi_role_arn" {
   description = "IRSA role ARN for the Secrets Store CSI driver (kube-system)"
   value       = aws_iam_role.secrets_store_csi.arn
 }
+
+output "cloudwatch_observability_role_arn" {
+  description = "IRSA role ARN for the amazon-cloudwatch-observability EKS addon (CloudWatch Agent + ADOT)"
+  value       = aws_iam_role.cloudwatch_observability.arn
+}
+
+output "karpenter_role_arn" {
+  description = "Karpenter controller IRSA role ARN — annotate karpenter SA with this"
+  value       = aws_iam_role.karpenter.arn
+}
+
+output "karpenter_interruption_queue_name" {
+  description = "SQS queue NAME for Karpenter interruption events — pass to eks_addons for Helm chart settings.interruptionQueueName"
+  value       = aws_sqs_queue.karpenter_interruption.name
+}
+
+output "karpenter_interruption_queue_arn" {
+  description = "SQS queue ARN for Karpenter interruption events"
+  value       = aws_sqs_queue.karpenter_interruption.arn
+}

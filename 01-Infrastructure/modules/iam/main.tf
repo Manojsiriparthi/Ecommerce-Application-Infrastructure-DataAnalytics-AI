@@ -82,7 +82,7 @@ resource "aws_iam_role_policy_attachment" "node_CloudWatchAgentServerPolicy" {
 # iam -> eks -> iam.
 
 # ==============================================
-# Bastion Host Role - SSM Session Manager access only
+# Bastion Host Role — SSM Session Manager access only
 # ==============================================
 resource "aws_iam_role" "bastion" {
   name = "${var.project_name}-bastion-role"
@@ -90,8 +90,8 @@ resource "aws_iam_role" "bastion" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ec2.amazonaws.com" }
     }]
   })
@@ -112,61 +112,5 @@ resource "aws_iam_instance_profile" "bastion" {
   role = aws_iam_role.bastion.name
 }
 
-# ==============================================
-# Jenkins Server Role - SSM Session Manager + CI/CD permissions
-# (EKS describe/update-kubeconfig, ECR push/pull, S3 for artifacts)
-# ==============================================
-resource "aws_iam_role" "jenkins" {
-  name = "${var.project_name}-jenkins-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
-  })
-
-  tags = {
-    Name        = "${var.project_name}-jenkins-role"
-    Environment = var.environment
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "jenkins_AmazonSSMManagedInstanceCore" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-  role       = aws_iam_role.jenkins.name
-}
-
-resource "aws_iam_role_policy_attachment" "jenkins_AmazonEC2ContainerRegistryPowerUser" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser"
-  role       = aws_iam_role.jenkins.name
-}
-
-resource "aws_iam_policy" "jenkins_eks_access" {
-  name        = "${var.project_name}-jenkins-eks-policy"
-  description = "Allow Jenkins to describe EKS cluster for kubeconfig and deploy"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "eks:DescribeCluster",
-        "eks:ListClusters"
-      ]
-      Resource = "*"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "jenkins_eks_access" {
-  policy_arn = aws_iam_policy.jenkins_eks_access.arn
-  role       = aws_iam_role.jenkins.name
-}
-
-resource "aws_iam_instance_profile" "jenkins" {
-  name = "${var.project_name}-jenkins-profile"
-  role = aws_iam_role.jenkins.name
-}
+# NOTE: Jenkins server role removed — compute module now contains bastion only.
+# Jenkins IAM resources can be re-added here when a dedicated CI server is needed.

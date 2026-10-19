@@ -60,21 +60,28 @@ module "eks" {
   private_route_dependency  = module.networking.private_route_table_association_ids
   database_route_dependency = module.networking.database_route_table_association_ids
 
-  # PRIMARY worker nodes — t3.small, 3 nodes (one per AZ) = 6 vCPU
-  # Total: 6 (workers) + 1 (public t3.micro) = 7 vCPU — fits under 8 limit
+  # PRIMARY worker nodes — t3.medium, 3 nodes (one per AZ)
   worker_instance_type = var.worker_instance_type
-  workers_desired      = 3    # one node per AZ (us-east-1a, 1b, 1c)
+  workers_desired      = 3
   workers_min          = 3
   workers_max          = 6
+  worker_disk_size_gb  = 50
 
-  # Public nodes — t3.micro (1 vCPU, ALB support only, no application pods)
+  # Public nodes — 2 nodes for ALB ip-mode HA (one per AZ minimum)
   public_node_instance_type = var.public_node_instance_type
-  public_desired            = 1
-  public_min                = 1
+  public_desired            = 2
+  public_min                = 2
   public_max                = 3
+
+  # Encrypt K8s Secrets at rest with the project KMS key
+  kms_key_arn = module.security.kms_key_arn
 
   # DB nodes — disabled: Aurora is AWS-managed
   create_db_nodes = false
+
+  # API server public endpoint CIDR allowlist — set in prod.tfvars:
+  #   cluster_endpoint_public_cidrs = ["10.0.0.0/16", "YOUR_IP/32", "NAT_EIP/32"]
+  cluster_endpoint_public_cidrs = var.cluster_endpoint_public_cidrs
 
   depends_on = [module.iam, module.networking]
 }
@@ -84,8 +91,12 @@ module "iam_irsa" {
 
   project_name      = "pip-project-ecommerce"
   environment       = var.environment
+  region            = var.primary_region
   oidc_provider_arn = module.eks.oidc_provider_arn
   oidc_provider_url = replace(module.eks.oidc_provider_url, "https://", "")
+
+  # Karpenter — SQS queue + EventBridge rules created IN iam-irsa (single apply)
+  karpenter_node_role_arn = module.iam.node_role_arn
 
   depends_on = [module.eks]
 }
@@ -99,22 +110,26 @@ module "eks_addons" {
     kubernetes = kubernetes
   }
 
-  project_name                = "pip-project-ecommerce"
-  cluster_name                = module.eks.cluster_name
-  region                      = var.primary_region
-  vpc_id                      = module.networking.vpc_id
-  ebs_csi_role_arn            = module.iam_irsa.ebs_csi_role_arn
-  lb_controller_role_arn      = module.iam_irsa.lb_controller_role_arn
-  cluster_autoscaler_role_arn = module.iam_irsa.cluster_autoscaler_role_arn
-  secrets_store_csi_role_arn  = module.iam_irsa.secrets_store_csi_role_arn
+  project_name                      = "pip-project-ecommerce"
+  cluster_name                      = module.eks.cluster_name
+  region                            = var.primary_region
+  environment                       = var.environment
+  vpc_id                            = module.networking.vpc_id
+  ebs_csi_role_arn                  = module.iam_irsa.ebs_csi_role_arn
+  lb_controller_role_arn            = module.iam_irsa.lb_controller_role_arn
+  cluster_autoscaler_role_arn       = module.iam_irsa.cluster_autoscaler_role_arn
+  secrets_store_csi_role_arn        = module.iam_irsa.secrets_store_csi_role_arn
+  cloudwatch_observability_role_arn = module.iam_irsa.cloudwatch_observability_role_arn
+
+  # Karpenter — replaces Cluster Autoscaler
+  karpenter_role_arn                = module.iam_irsa.karpenter_role_arn
+  karpenter_node_role_name          = module.iam.node_role_name
+  karpenter_interruption_queue_name = module.iam_irsa.karpenter_interruption_queue_name
 
   depends_on = [module.eks, module.iam_irsa]
 }
 
 module "compute" {
-  # Disabled while vCPU limit increase is pending.
-  # bastion (t3.micro=1 vCPU) + jenkins (t3.medium=2 vCPU) = 3 vCPU saved.
-  # Set enable_compute = true in prod.tfvars once limit is raised to 32.
   count  = var.enable_compute ? 1 : 0
   source = "../../modules/compute"
 
@@ -122,11 +137,8 @@ module "compute" {
   environment                   = var.environment
   ami_id                        = var.ami_id
   public_subnet_id              = module.networking.public_subnet_ids[0]
-  private_subnet_id             = module.networking.private_subnet_ids[0]
   bastion_sg_id                 = module.networking.bastion_sg_id
-  jenkins_sg_id                 = module.networking.jenkins_sg_id
   bastion_instance_profile_name = module.iam.bastion_instance_profile_name
-  jenkins_instance_profile_name = module.iam.jenkins_instance_profile_name
 
   depends_on = [module.networking, module.iam]
 }
@@ -137,6 +149,7 @@ module "messaging" {
   project_name = "pip-project-ecommerce"
   environment  = var.environment
   kms_key_arn  = module.security.kms_key_arn
+  alert_email  = var.alert_email   # set in prod.tfvars: alert_email = "ops@yourcompany.com"
 
   depends_on = [module.security]
 }
@@ -159,10 +172,12 @@ module "aurora" {
   kms_key_arn          = module.security.kms_key_arn
   db_secret_arn        = module.security.db_secret_arn
   instance_class       = var.aurora_instance_class
-  reader_count         = var.aurora_reader_count
-  deletion_protection  = true   # production DB protected. To destroy later, set
-                                 # false first, apply, then destroy.
+  reader_count         = var.aurora_reader_count   # 2 readers: cross-AZ HA
+  deletion_protection  = true
   sns_topic_arn        = module.messaging.sns_topic_arn
+
+  # Cross-AZ placement: writer→AZ[0], reader-1→AZ[1], reader-2→AZ[2]
+  availability_zones = var.azs
 
   # DB/table creation removed from Terraform (was hanging apply via local-exec).
   # Run ./06-Scripts/01-setup-databases.sh after apply instead.
@@ -174,6 +189,8 @@ module "aurora" {
   # Wire DR networking outputs so Aurora Global DB secondary gets its subnet + SG
   dr_db_subnet_group_name = module.networking_dr.db_subnet_group_name
   dr_aurora_sg_id         = module.networking_dr.aurora_sg_id
+  dr_reader_count         = 2                # 2 readers in DR — cross-AZ, ready for failover
+  dr_availability_zones   = var.dr_azs       # pin DR readers to different AZs
 
   # Aurora no longer depends on EKS (db_setup local-exec removed).
   # It only needs networking, security (KMS), messaging (SNS), and DR networking.
@@ -356,6 +373,7 @@ module "eks_dr" {
   workers_desired      = 3
   workers_min          = 3
   workers_max          = 6
+  worker_disk_size_gb  = 50
 
   # Public node — needed for ALB ip-mode target routing (same as primary)
   public_node_instance_type = "t3.micro"
@@ -363,7 +381,13 @@ module "eks_dr" {
   public_min                = 1
   public_max                = 3
 
+  # DR KMS key (regional — cannot reuse primary key across regions)
+  kms_key_arn = aws_kms_key.dr_logs.arn
+
   create_db_nodes = false
+
+  # DR API endpoint: same allowlist as primary
+  cluster_endpoint_public_cidrs = var.cluster_endpoint_public_cidrs
 
   depends_on = [module.iam, module.networking_dr]
 }
@@ -378,11 +402,14 @@ module "iam_irsa_dr" {
   }
 
   # Use -dr suffix so IRSA role names don't clash with primary region IRSA roles
-  # (IRSA roles include the OIDC URL in their trust policy, so they must be separate)
   project_name      = "pip-project-ecommerce-dr"
   environment       = "${var.environment}-dr"
+  region            = var.dr_region
   oidc_provider_arn = module.eks_dr.oidc_provider_arn
   oidc_provider_url = replace(module.eks_dr.oidc_provider_url, "https://", "")
+
+  # IAM is global — same node role works in DR region
+  karpenter_node_role_arn = module.iam.node_role_arn
 
   depends_on = [module.eks_dr]
 }
@@ -460,14 +487,21 @@ module "eks_addons_dr" {
     kubernetes = kubernetes.dr
   }
 
-  project_name                = "pip-project-ecommerce"
-  cluster_name                = module.eks_dr.cluster_name
-  region                      = var.dr_region
-  vpc_id                      = module.networking_dr.vpc_id
-  ebs_csi_role_arn            = module.iam_irsa_dr.ebs_csi_role_arn
-  lb_controller_role_arn      = module.iam_irsa_dr.lb_controller_role_arn
-  cluster_autoscaler_role_arn = module.iam_irsa_dr.cluster_autoscaler_role_arn
-  secrets_store_csi_role_arn  = module.iam_irsa_dr.secrets_store_csi_role_arn
+  project_name                      = "pip-project-ecommerce"
+  cluster_name                      = module.eks_dr.cluster_name
+  region                            = var.dr_region
+  environment                       = var.environment
+  vpc_id                            = module.networking_dr.vpc_id
+  ebs_csi_role_arn                  = module.iam_irsa_dr.ebs_csi_role_arn
+  lb_controller_role_arn            = module.iam_irsa_dr.lb_controller_role_arn
+  cluster_autoscaler_role_arn       = module.iam_irsa_dr.cluster_autoscaler_role_arn
+  secrets_store_csi_role_arn        = module.iam_irsa_dr.secrets_store_csi_role_arn
+  cloudwatch_observability_role_arn = module.iam_irsa_dr.cloudwatch_observability_role_arn
+
+  # Karpenter DR
+  karpenter_role_arn                = module.iam_irsa_dr.karpenter_role_arn
+  karpenter_node_role_name          = module.iam.node_role_name
+  karpenter_interruption_queue_name = module.iam_irsa_dr.karpenter_interruption_queue_name
 
   depends_on = [module.eks_dr, module.iam_irsa_dr]
 }

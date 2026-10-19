@@ -1,3 +1,6 @@
+# Account ID — used for building EventBridge rule ARNs in the SQS queue policy
+data "aws_caller_identity" "current" {}
+
 # ==============================================
 # EBS CSI Driver IRSA Role
 # ==============================================
@@ -406,4 +409,285 @@ resource "aws_iam_policy" "secrets_store_csi_policy" {
 resource "aws_iam_role_policy_attachment" "secrets_store_csi_custom" {
   policy_arn = aws_iam_policy.secrets_store_csi_policy.arn
   role       = aws_iam_role.secrets_store_csi.name
+}
+
+# ==============================================
+# CloudWatch Observability IRSA Role
+# Used by: amazon-cloudwatch-observability EKS addon
+#   - CloudWatch Agent (node/pod metrics → Container Insights)
+#   - ADOT collector (app traces → X-Ray)
+#
+# Service account: cloudwatch-agent (kube-system)
+# AWS-managed policy covers all required CW, X-Ray, and EC2 permissions.
+# ==============================================
+resource "aws_iam_role" "cloudwatch_observability" {
+  name = "${var.project_name}-cloudwatch-observability-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Effect    = "Allow"
+      Principal = { Federated = var.oidc_provider_arn }
+      Condition = {
+        StringEquals = {
+          "${var.oidc_provider_url}:sub" = "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent"
+          "${var.oidc_provider_url}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-cloudwatch-observability-role"
+    Environment = var.environment
+  }
+}
+
+# AWS-managed policy: grants Container Insights + ADOT all required permissions
+# (CloudWatch PutMetricData, logs:*, xray:*, ec2:Describe*, etc.)
+resource "aws_iam_role_policy_attachment" "cloudwatch_observability" {
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+  role       = aws_iam_role.cloudwatch_observability.name
+}
+
+# X-Ray write access for ADOT traces
+resource "aws_iam_role_policy_attachment" "cloudwatch_observability_xray" {
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+  role       = aws_iam_role.cloudwatch_observability.name
+}
+
+# =============================================================================
+# KARPENTER — SQS QUEUE + EVENTBRIDGE RULES (created before the role so the
+# role policy can scope to the real queue ARN in a single terraform apply)
+# =============================================================================
+# WHY HERE (not in eks-addons):
+#   The Karpenter IRSA role needs the SQS queue ARN to scope its sqs:ReceiveMessage
+#   permission. If the queue were created in eks_addons (which runs AFTER iam_irsa),
+#   the role policy would need a wildcard "*" or a second terraform apply.
+#   By creating the queue here, the role policy is scoped correctly on apply #1.
+#
+# The queue NAME is output and passed to eks_addons for the Helm chart setting
+# `settings.interruptionQueueName`.
+# =============================================================================
+
+# ── SQS queue for interruption events ────────────────────────────────────────
+resource "aws_sqs_queue" "karpenter_interruption" {
+  name                       = "${var.project_name}-karpenter-interruption"
+  message_retention_seconds  = 300
+  visibility_timeout_seconds = 60
+  sqs_managed_sse_enabled    = true
+
+  tags = {
+    Name        = "${var.project_name}-karpenter-interruption"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_sqs_queue_policy" "karpenter_interruption" {
+  queue_url = aws_sqs_queue.karpenter_interruption.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowEventBridge"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.karpenter_interruption.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = "arn:aws:events:${var.region}:${data.aws_caller_identity.current.account_id}:rule/${var.project_name}-karpenter-*"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# ── EventBridge rules → forward interruption events to the SQS queue ──────────
+resource "aws_cloudwatch_event_rule" "karpenter_spot_interruption" {
+  name        = "${var.project_name}-karpenter-spot-interruption"
+  description = "Spot instance interruption warning (2 min before termination)"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ec2"]
+    detail-type = ["EC2 Spot Instance Interruption Warning"]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-karpenter-spot-rule"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_spot_interruption" {
+  rule      = aws_cloudwatch_event_rule.karpenter_spot_interruption.name
+  target_id = "KarpenterInterruptionQueue"
+  arn       = aws_sqs_queue.karpenter_interruption.arn
+}
+
+resource "aws_cloudwatch_event_rule" "karpenter_scheduled_change" {
+  name        = "${var.project_name}-karpenter-scheduled-change"
+  description = "AWS health scheduled maintenance events"
+
+  event_pattern = jsonencode({
+    source      = ["aws.health"]
+    detail-type = ["AWS Health Event"]
+    detail = {
+      service           = ["EC2"]
+      eventTypeCategory = ["scheduledChange"]
+    }
+  })
+
+  tags = {
+    Name        = "${var.project_name}-karpenter-health-rule"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_scheduled_change" {
+  rule      = aws_cloudwatch_event_rule.karpenter_scheduled_change.name
+  target_id = "KarpenterInterruptionQueue"
+  arn       = aws_sqs_queue.karpenter_interruption.arn
+}
+
+resource "aws_cloudwatch_event_rule" "karpenter_rebalance" {
+  name        = "${var.project_name}-karpenter-rebalance"
+  description = "Spot rebalance recommendation — start migrating before interruption"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ec2"]
+    detail-type = ["EC2 Spot Instance Rebalance Recommendation"]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-karpenter-rebalance-rule"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_rebalance" {
+  rule      = aws_cloudwatch_event_rule.karpenter_rebalance.name
+  target_id = "KarpenterInterruptionQueue"
+  arn       = aws_sqs_queue.karpenter_interruption.arn
+}
+
+# ==============================================
+# Karpenter IRSA Role
+# ==============================================
+# WHAT KARPENTER DOES WITH THESE PERMISSIONS:
+#   ec2:RunInstances                → launch EC2 nodes for pending pods
+#   ec2:CreateTags / DeleteTags      → tag nodes with cluster + workload metadata
+#   ec2:Describe*                    → discover available instance types + AZs
+#   iam:PassRole                     → pass the EKS node role to new EC2 instances
+#   sqs:ReceiveMessage / DeleteMessage → read Spot interruption events from the
+#                                       Karpenter interruption queue
+#   pricing:GetProducts              → query AWS for Spot pricing
+#
+# SUBNET + SG DISCOVERY:
+#   Karpenter discovers subnets and SGs by the cluster tag
+#   karpenter.sh/discovery=<cluster-name>. The EKS module must add this tag
+#   to its subnets (set in networking module) and the node SG.
+# ==============================================
+resource "aws_iam_role" "karpenter" {
+  name = "${var.project_name}-karpenter-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Effect    = "Allow"
+      Principal = { Federated = var.oidc_provider_arn }
+      Condition = {
+        StringEquals = {
+          "${var.oidc_provider_url}:sub" = "system:serviceaccount:karpenter:karpenter"
+          "${var.oidc_provider_url}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-karpenter-role"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_policy" "karpenter" {
+  name        = "${var.project_name}-karpenter-policy"
+  description = "Permissions for Karpenter controller — launch EC2 nodes, pass node role, read Spot interruption queue"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EC2RunInstances"
+        Effect = "Allow"
+        Action = [
+          "ec2:RunInstances",
+          "ec2:CreateFleet",
+          "ec2:CreateLaunchTemplate",
+          "ec2:CreateTags",
+          "ec2:DeleteLaunchTemplate",
+          "ec2:DeleteTags",
+          "ec2:DescribeImages",
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceTypeOfferings",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeLaunchTemplates",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSpotPriceHistory",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeVpcs"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = var.region
+          }
+        }
+      },
+      {
+        Sid    = "PassRoleToEC2"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        # Karpenter must pass the EKS node role to new EC2 instances.
+        # Scoped to the node role ARN only — not wildcard.
+        Resource = var.karpenter_node_role_arn
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ec2.amazonaws.com"
+          }
+        }
+      },
+      {
+        Sid    = "SpotInterruptionQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ReceiveMessage"
+        ]
+        # Scoped to the actual Karpenter interruption queue ARN (created above
+        # in this same module — single apply, no wildcard, no second pass)
+        Resource = aws_sqs_queue.karpenter_interruption.arn
+      },
+      {
+        Sid    = "Pricing"
+        Effect = "Allow"
+        Action = "pricing:GetProducts"
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter" {
+  policy_arn = aws_iam_policy.karpenter.arn
+  role       = aws_iam_role.karpenter.name
 }

@@ -73,19 +73,27 @@ module "eks" {
 
   # Worker nodes — run all application pods (private subnets)
   worker_instance_type = var.worker_instance_type
-  workers_desired      = 2
-  workers_min          = 2
+  workers_desired      = 3
+  workers_min          = 3
   workers_max          = 6
+  worker_disk_size_gb  = 50   # 50 GB: avoids image-cache pressure on busy nodes
 
-  # Public nodes — 1 per AZ is enough for ALB ip-mode support (small instance)
+  # Public nodes — 2 nodes for ALB ip-mode HA support
   public_node_instance_type = var.public_node_instance_type
-  public_desired            = 1
-  public_min                = 1
+  public_desired            = 2
+  public_min                = 2
   public_max                = 3
 
+  # Encrypt K8s Secrets at rest with the project KMS key
+  kms_key_arn = module.security.kms_key_arn
+
   # DB nodes — disabled: Aurora is AWS-managed, no pods need database subnets today.
-  # Enable in the future by setting create_db_nodes = true and adding db_node_instance_type.
   create_db_nodes = false
+
+  # API server public endpoint CIDR allowlist — set in dev.tfvars:
+  #   cluster_endpoint_public_cidrs = ["10.0.0.0/16", "YOUR_IP/32", "NAT_EIP/32"]
+  # Leave default (0.0.0.0/0) until you know your NAT EIP and office IP.
+  cluster_endpoint_public_cidrs = var.cluster_endpoint_public_cidrs
 
   depends_on = [module.iam, module.networking]
 }
@@ -95,8 +103,13 @@ module "iam_irsa" {
 
   project_name      = "pip-project-ecommerce"
   environment       = var.environment
+  region           = var.primary_region
   oidc_provider_arn = module.eks.oidc_provider_arn
   oidc_provider_url = replace(module.eks.oidc_provider_url, "https://", "")
+
+  # Karpenter — pass node role so Karpenter can launch EC2 as the EKS node role
+  # SQS queue + EventBridge rules are created IN iam-irsa (single apply, scoped ARN)
+  karpenter_node_role_arn = module.iam.node_role_arn
 
   depends_on = [module.eks]
 }
@@ -104,14 +117,21 @@ module "iam_irsa" {
 module "eks_addons" {
   source = "../../modules/eks-addons"
 
-  project_name                = "pip-project-ecommerce"
-  cluster_name                = module.eks.cluster_name
-  region                      = var.primary_region
-  vpc_id                      = module.networking.vpc_id
-  ebs_csi_role_arn            = module.iam_irsa.ebs_csi_role_arn
-  lb_controller_role_arn      = module.iam_irsa.lb_controller_role_arn
-  cluster_autoscaler_role_arn = module.iam_irsa.cluster_autoscaler_role_arn
-  secrets_store_csi_role_arn  = module.iam_irsa.secrets_store_csi_role_arn
+  project_name                      = "pip-project-ecommerce"
+  cluster_name                      = module.eks.cluster_name
+  region                            = var.primary_region
+  environment                       = var.environment
+  vpc_id                            = module.networking.vpc_id
+  ebs_csi_role_arn                  = module.iam_irsa.ebs_csi_role_arn
+  lb_controller_role_arn            = module.iam_irsa.lb_controller_role_arn
+  cluster_autoscaler_role_arn       = module.iam_irsa.cluster_autoscaler_role_arn
+  secrets_store_csi_role_arn        = module.iam_irsa.secrets_store_csi_role_arn
+  cloudwatch_observability_role_arn = module.iam_irsa.cloudwatch_observability_role_arn
+
+  # Karpenter — replaces Cluster Autoscaler
+  karpenter_role_arn               = module.iam_irsa.karpenter_role_arn
+  karpenter_node_role_name         = module.iam.node_role_name
+  karpenter_interruption_queue_name = module.iam_irsa.karpenter_interruption_queue_name
 
   depends_on = [module.eks, module.iam_irsa]
 }
@@ -123,11 +143,8 @@ module "compute" {
   environment                   = var.environment
   ami_id                        = var.ami_id
   public_subnet_id              = module.networking.public_subnet_ids[0]
-  private_subnet_id             = module.networking.private_subnet_ids[0]
   bastion_sg_id                 = module.networking.bastion_sg_id
-  jenkins_sg_id                 = module.networking.jenkins_sg_id
   bastion_instance_profile_name = module.iam.bastion_instance_profile_name
-  jenkins_instance_profile_name = module.iam.jenkins_instance_profile_name
 
   depends_on = [module.networking, module.iam]
 }
@@ -138,6 +155,7 @@ module "messaging" {
   project_name = "pip-project-ecommerce"
   environment  = var.environment
   kms_key_arn  = module.security.kms_key_arn
+  alert_email  = var.alert_email   # set in dev.tfvars: alert_email = "ops@yourcompany.com"
 
   depends_on = [module.security]
 }
@@ -160,9 +178,12 @@ module "aurora" {
   kms_key_arn          = module.security.kms_key_arn
   db_secret_arn        = module.security.db_secret_arn
   instance_class       = var.aurora_instance_class
-  reader_count         = var.aurora_reader_count
+  reader_count         = var.aurora_reader_count   # 2 readers: cross-AZ HA
   deletion_protection  = false
   sns_topic_arn        = module.messaging.sns_topic_arn
+
+  # Cross-AZ placement: writer→AZ[0], reader-1→AZ[1], reader-2→AZ[2]
+  availability_zones = var.azs
 
   enable_global_db = var.enable_global_db
   primary_region   = var.primary_region

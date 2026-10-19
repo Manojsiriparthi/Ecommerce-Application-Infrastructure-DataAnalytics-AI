@@ -85,7 +85,24 @@ resource "aws_rds_cluster_instance" "secondary" {
   engine_version       = var.engine_version
   db_subnet_group_name = var.dr_db_subnet_group_name
 
+  # Cross-AZ spread in DR region: reader-0 → DR AZ[0], reader-1 → DR AZ[1]
+  availability_zone = (
+    length(var.dr_availability_zones) > 0
+    ? var.dr_availability_zones[count.index % length(var.dr_availability_zones)]
+    : null
+  )
+
   performance_insights_enabled = var.performance_insights_enabled
+
+  tags = {
+    Name        = "${var.project_name}-dr-reader-${count.index + 1}"
+    Environment = "${var.environment}-dr"
+    AZ          = (
+      length(var.dr_availability_zones) > 0
+      ? var.dr_availability_zones[count.index % length(var.dr_availability_zones)]
+      : "auto"
+    )
+  }
 }
 
 # ==============================================

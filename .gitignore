@@ -14,6 +14,10 @@
 override.tf
 override.tf.json
 
+# Allow environment tfvars templates (no secrets — sensitive values via TF_VAR_* env vars)
+!01-Infrastructure/environments/dev/dev.tfvars
+!01-Infrastructure/environments/prod/prod.tfvars
+
 # Rendered K8s manifests (deploy script fills placeholders into these temp
 # files per-region; the source .yaml keeps its <PLACEHOLDER> tokens).
 **/*.rendered.yaml

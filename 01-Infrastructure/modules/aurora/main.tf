@@ -43,17 +43,28 @@ resource "aws_rds_cluster" "primary" {
 }
 
 # ==============================================
-# Writer Instance (Promotion Tier 0)
+# Writer Instance — pinned to AZ[0]
+# ==============================================
+# WHY AZ PINNING:
+#   Without explicit availability_zone, AWS places instances freely.
+#   Two instances can land in the same AZ, meaning an AZ failure takes
+#   out both writer and reader simultaneously — no HA benefit.
+#   Pinning guarantees: writer in AZ-a, reader-1 in AZ-b, reader-2 in AZ-c.
+#   Result: any single AZ failure loses at most 1 instance; the cluster
+#   auto-promotes a reader in a surviving AZ within ~30 seconds.
 # ==============================================
 resource "aws_rds_cluster_instance" "writer" {
-  identifier           = "${var.project_name}-writer"
-  cluster_identifier   = aws_rds_cluster.primary.id
-  instance_class       = var.instance_class
-  engine               = aws_rds_cluster.primary.engine
-  engine_version       = aws_rds_cluster.primary.engine_version
-  db_subnet_group_name = var.db_subnet_group_name
+  identifier              = "${var.project_name}-writer"
+  cluster_identifier      = aws_rds_cluster.primary.id
+  instance_class          = var.instance_class
+  engine                  = aws_rds_cluster.primary.engine
+  engine_version          = aws_rds_cluster.primary.engine_version
+  db_subnet_group_name    = var.db_subnet_group_name
   db_parameter_group_name = aws_db_parameter_group.ecommerce.name
-  promotion_tier       = 0
+  promotion_tier          = 0
+
+  # Pin to first AZ — writer always in AZ[0]
+  availability_zone = length(var.availability_zones) > 0 ? var.availability_zones[0] : null
 
   auto_minor_version_upgrade            = true
   preferred_maintenance_window          = var.maintenance_window
@@ -65,22 +76,46 @@ resource "aws_rds_cluster_instance" "writer" {
   tags = {
     Name        = "${var.project_name}-writer"
     Environment = var.environment
+    AZ          = length(var.availability_zones) > 0 ? var.availability_zones[0] : "auto"
   }
 }
 
 # ==============================================
-# Reader Instances (Promotion Tier 1, across AZs)
+# Reader Instances — each pinned to a different AZ
+# ==============================================
+# reader-1 → AZ[1]  (different AZ from writer)
+# reader-2 → AZ[2]  (third AZ — survives any single AZ failure)
+#
+# CROSS-AZ READ SCALING:
+#   Both readers handle SELECT queries via the cluster reader endpoint.
+#   Aurora automatically load-balances reads across all healthy readers.
+#   Applications using the reader endpoint get horizontal read scaling
+#   with automatic failover — if one reader's AZ goes down, Aurora
+#   routes reads to the surviving reader within seconds.
+#
+# PROMOTION ORDER:
+#   promotion_tier = 1 on all readers → any reader can become writer
+#   if the current writer fails. Aurora picks the reader with the
+#   least lag (most up-to-date) to minimise data loss.
 # ==============================================
 resource "aws_rds_cluster_instance" "readers" {
-  count                = var.reader_count
-  identifier           = "${var.project_name}-reader-${count.index + 1}"
-  cluster_identifier   = aws_rds_cluster.primary.id
-  instance_class       = var.instance_class
-  engine               = aws_rds_cluster.primary.engine
-  engine_version       = aws_rds_cluster.primary.engine_version
-  db_subnet_group_name = var.db_subnet_group_name
+  count                   = var.reader_count
+  identifier              = "${var.project_name}-reader-${count.index + 1}"
+  cluster_identifier      = aws_rds_cluster.primary.id
+  instance_class          = var.instance_class
+  engine                  = aws_rds_cluster.primary.engine
+  engine_version          = aws_rds_cluster.primary.engine_version
+  db_subnet_group_name    = var.db_subnet_group_name
   db_parameter_group_name = aws_db_parameter_group.ecommerce.name
-  promotion_tier       = 1
+  promotion_tier          = 1
+
+  # Pin each reader to a distinct AZ: index+1 wraps around if fewer AZs than readers
+  # reader-0 → AZ[1], reader-1 → AZ[2], reader-2 → AZ[0] (wraps), etc.
+  availability_zone = (
+    length(var.availability_zones) > 0
+    ? var.availability_zones[(count.index + 1) % length(var.availability_zones)]
+    : null
+  )
 
   auto_minor_version_upgrade            = true
   preferred_maintenance_window          = var.maintenance_window
@@ -92,6 +127,11 @@ resource "aws_rds_cluster_instance" "readers" {
   tags = {
     Name        = "${var.project_name}-reader-${count.index + 1}"
     Environment = var.environment
+    AZ          = (
+      length(var.availability_zones) > 0
+      ? var.availability_zones[(count.index + 1) % length(var.availability_zones)]
+      : "auto"
+    )
   }
 
   depends_on = [aws_rds_cluster_instance.writer]

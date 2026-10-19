@@ -60,9 +60,9 @@ variable "eks_cluster_version" {
 }
 
 variable "aurora_engine_version" {
-  description = "Aurora PostgreSQL engine version (must support Global Database when enable_global_db = true)"
+  description = "Aurora PostgreSQL engine version. 17.9 = latest Aurora PostgreSQL LTS as of 2026."
   type        = string
-  default     = "15.4"
+  default     = "17.9"
 }
 
 variable "ami_id" {
@@ -77,21 +77,34 @@ variable "db_master_password" {
 }
 
 variable "aurora_instance_class" {
-  description = "Aurora instance class"
+  description = "Aurora instance class — prod uses db.r6g.large (16 GB RAM, Graviton2, no CPU bursting)"
   type        = string
-  default     = "db.t3.medium"
+  default     = "db.r6g.large"
 }
 
 variable "aurora_reader_count" {
-  description = "Number of Aurora reader instances"
-  type        = number
-  default     = 2
+  description = <<-EOT
+    Number of Aurora reader instances in the primary cluster.
+    2 = cross-AZ read HA: reader-1 in AZ[1], reader-2 in AZ[2].
+    Writer is in AZ[0]. Any single AZ failure leaves 1 reader + the surviving
+    nodes to handle traffic. Aurora auto-promotes a reader to writer in ~30s.
+    Do NOT set below 2 — 1 reader means an AZ failure can take out both
+    writer and reader simultaneously.
+  EOT
+  type    = number
+  default = 2
 }
 
 variable "enable_global_db" {
-  description = "Enable Aurora Global Database (cross-region DR)"
-  type        = bool
-  default     = true
+  description = <<-EOT
+    Enable Aurora Global Database (cross-region replication to DR region).
+    Prod: true — async replication to us-west-2 DR cluster (typically <1s lag).
+    Secondary cluster has 2 cross-AZ readers, ready for promotion.
+    During failover:
+      aws rds failover-global-cluster --global-cluster-identifier <id>
+  EOT
+  type    = bool
+  default = true
 }
 
 # ==============================================
@@ -147,6 +160,27 @@ variable "alb_dns_name" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "cluster_endpoint_public_cidrs" {
+  description = <<-EOT
+    CIDRs allowed to reach the EKS public API endpoint (kubectl/API access).
+    Default 0.0.0.0/0 keeps things open — MUST be restricted for production.
+
+    What to add:
+      - VPC CIDR         : "10.0.0.0/16"        all nodes + bastion inside VPC
+      - Your office IP   : "203.0.113.45/32"     your laptop/workstation
+      - NAT Gateway EIP  : "52.90.100.200/32"    private nodes hit the API via NAT
+      - CI/CD runner IP  : "18.209.0.0/16"       GitHub Actions / Jenkins runner
+
+    Get your NAT EIP after first apply:
+      terraform output -raw nat_gateway_eip
+      OR: AWS Console → VPC → Elastic IPs
+
+    /32 = exactly one IP.   /16 = a range.
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
 }
 
 # ==============================================
@@ -221,4 +255,10 @@ variable "discover_alb_from_ingress" {
   EOT
   type        = bool
   default     = false
+}
+
+variable "alert_email" {
+  description = "Email address for SNS alarm notifications (Aurora, EKS, ALB, NAT). Leave empty to skip."
+  type        = string
+  default     = ""
 }
