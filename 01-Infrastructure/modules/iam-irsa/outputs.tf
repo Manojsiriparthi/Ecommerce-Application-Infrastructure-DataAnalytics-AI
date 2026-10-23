@@ -42,3 +42,8 @@ output "karpenter_interruption_queue_arn" {
   description = "SQS queue ARN for Karpenter interruption events"
   value       = aws_sqs_queue.karpenter_interruption.arn
 }
+
+output "keda_role_arn" {
+  description = "KEDA IRSA role ARN — annotate keda-operator SA with this. Grants SQS + CloudWatch read for event-driven autoscaling."
+  value       = aws_iam_role.keda.arn
+}

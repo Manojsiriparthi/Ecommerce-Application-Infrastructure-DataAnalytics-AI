@@ -471,3 +471,95 @@ resource "aws_security_group" "jenkins" {
     Environment = var.environment
   }
 }
+
+# =============================================================================
+# VPC ENDPOINTS (PrivateLink) — keeps AWS service traffic private + saves NAT cost
+# =============================================================================
+# WHY:
+#   Without VPC endpoints, pods in private subnets reach AWS services
+#   (ECR, S3, Secrets Manager, SSM, CloudWatch, STS, KMS) via NAT Gateway.
+#   That costs $0.045/GB data processing + traffic goes over the internet.
+#
+#   With VPC endpoints:
+#     - Traffic stays WITHIN the AWS network (no internet round-trip)
+#     - No NAT data processing charges for these services
+#     - Faster (1-2ms latency vs 20-50ms via NAT + internet)
+#     - More secure (no public internet exposure)
+#
+# ENDPOINT TYPES:
+#   Interface endpoints (ENI in subnet, private DNS):
+#     ECR API, ECR DKR, Secrets Manager, SSM, CloudWatch Logs, STS, KMS
+#   Gateway endpoint (route table entry, no ENI):
+#     S3 (gateway is free — no hourly charge, no data charge)
+# =============================================================================
+
+# ── Security Group for interface endpoints ────────────────────────────────────
+resource "aws_security_group" "vpc_endpoints" {
+  name        = "${var.project_name}-vpc-endpoints-sg"
+  description = "Allow HTTPS from VPC to VPC interface endpoints"
+  vpc_id      = aws_vpc.ecommerce.id
+
+  ingress {
+    description = "HTTPS from VPC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "${var.project_name}-vpc-endpoints-sg"
+    Environment = var.environment
+  }
+}
+
+# ── Interface endpoints (ECR, Secrets Manager, SSM, Logs, STS, KMS) ───────────
+locals {
+  interface_endpoints = [
+    "ecr.api",            # ECR API — list/describe repos
+    "ecr.dkr",            # ECR Docker — push/pull images
+    "secretsmanager",     # Secrets Manager — read secrets
+    "ssm",                # SSM Parameter Store — read parameters
+    "logs",               # CloudWatch Logs — write pod logs
+    "sts",                # STS — IRSA token exchange
+    "kms",                # KMS — decrypt encrypted secrets
+  ]
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each              = toset(local.interface_endpoints)
+  vpc_id                = aws_vpc.ecommerce.id
+  service_name          = "com.amazonaws.${var.aws_region}.${each.value}"
+  vpc_endpoint_type     = "Interface"
+  private_dns_enabled   = true
+  subnet_ids            = aws_subnet.private[*].id
+  security_group_ids    = [aws_security_group.vpc_endpoints.id]
+
+  tags = {
+    Name        = "${var.project_name}-${each.value}-endpoint"
+    Environment = var.environment
+    Service     = each.value
+  }
+}
+
+# ── Gateway endpoint for S3 (free — no hourly charge) ────────────────────────
+# Routes S3 traffic through the VPC instead of the internet gateway.
+# This is the biggest cost saver — ECR images are stored in S3 behind the scenes.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.ecommerce.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id, aws_route_table.public.id]
+
+  tags = {
+    Name        = "${var.project_name}-s3-endpoint"
+    Environment = var.environment
+  }
+}

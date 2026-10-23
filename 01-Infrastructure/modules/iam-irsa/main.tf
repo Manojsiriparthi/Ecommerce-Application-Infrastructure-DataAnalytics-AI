@@ -691,3 +691,92 @@ resource "aws_iam_role_policy_attachment" "karpenter" {
   policy_arn = aws_iam_policy.karpenter.arn
   role       = aws_iam_role.karpenter.name
 }
+
+# ==============================================
+# KEDA IRSA Role — event-driven autoscaling
+# ==============================================
+# WHAT KEDA NEEDS:
+#   sqs:GetQueueAttributes  → read SQS queue depth for scale triggers
+#   cloudwatch:GetMetricData → read CloudWatch metrics for scale triggers
+#   kafka:*                  → read consumer lag (if using MSK)
+#
+# APP USAGE:
+#   Each service creates a ScaledObject with a trigger:
+#     trigger:
+#       type: aws-sqs
+#       metadata:
+#         queueURL: https://sqs.us-east-1.amazonaws.com/123/order-queue
+#         awsRegion: us-east-1
+#   KEDA reads the queue depth every 30s and scales the Deployment.
+# ==============================================
+resource "aws_iam_role" "keda" {
+  name = "${var.project_name}-keda-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Effect    = "Allow"
+      Principal = { Federated = var.oidc_provider_arn }
+      Condition = {
+        StringEquals = {
+          "${var.oidc_provider_url}:sub" = "system:serviceaccount:keda:keda-operator"
+          "${var.oidc_provider_url}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = {
+    Name        = "${var.project_name}-keda-role"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_policy" "keda" {
+  name        = "${var.project_name}-keda-policy"
+  description = "KEDA — read SQS queue depth + CloudWatch metrics for event-driven autoscaling"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "SQSRead"
+        Effect = "Allow"
+        Action = [
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ListQueues"
+        ]
+        # Scoped to project queues only
+        Resource = "arn:aws:sqs:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project_name}-*"
+      },
+      {
+        Sid    = "CloudWatchRead"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:GetMetricData",
+          "cloudwatch:GetMetricStatistics",
+          "cloudwatch:ListMetrics"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "DynamoDBRead"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:DescribeTable",
+          "dynamodb:DescribeContinuousBackups",
+          "dynamodb:ListBackups"
+        ]
+        # Scoped to project tables only
+        Resource = "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/${var.project_name}-*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "keda" {
+  policy_arn = aws_iam_policy.keda.arn
+  role       = aws_iam_role.keda.name
+}

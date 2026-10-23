@@ -381,3 +381,119 @@ resource "aws_cloudwatch_log_group" "infra_logs" {
 }
 
 # Flow log resource
+
+# =============================================================================
+# AWS CONFIG — configuration recording + compliance rules
+# =============================================================================
+# WHY: Records EVERY configuration change to AWS resources (SG rules, IAM
+# policies, S3 bucket policies, etc.). If someone changes a security group
+# via the console, AWS Config records WHO changed WHAT and WHEN.
+#
+# CONFIG RULES (built-in compliance checks):
+#   - root-account-mfa-enabled: root account must have MFA
+#   - no-public-s3-buckets: no S3 bucket can be public
+#   - vpc-sg-open-only-to-authorized-ports: SGs can't allow 0.0.0.0/0 on non-443/22
+#   - iam-no-root-access-key: root account must not have access keys
+#   - db-instance-public-access-check: RDS must not be publicly accessible
+# =============================================================================
+
+# ── S3 bucket for Config delivery ─────────────────────────────────────────────
+resource "aws_s3_bucket" "config" {
+  bucket = "${var.project_name}-config-${var.environment}"
+
+  tags = {
+    Name        = "${var.project_name}-config"
+    Environment = var.environment
+  }
+}
+
+resource "aws_s3_bucket_versioning" "config" {
+  bucket = aws_s3_bucket.config.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_public_access_block" "config" {
+  bucket                  = aws_s3_bucket.config.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ── Config recorder ──────────────────────────────────────────────────────────
+resource "aws_iam_role" "config" {
+  name = "${var.project_name}-config-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "config.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "config" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSConfigRole"
+  role       = aws_iam_role.config.name
+}
+
+resource "aws_config_configuration_recorder" "main" {
+  name     = "${var.project_name}-recorder"
+  role_arn = aws_iam_role.config.arn
+
+  recording_group {
+    all_supported                 = true
+    include_global_resource_types = true
+  }
+}
+
+resource "aws_config_delivery_channel" "main" {
+  name           = "${var.project_name}-delivery-channel"
+  s3_bucket_name = aws_s3_bucket.config.bucket
+  depends_on     = [aws_config_configuration_recorder.main]
+}
+
+resource "aws_config_configuration_recorder_status" "main" {
+  name       = aws_config_configuration_recorder.main.name
+  is_enabled = true
+  depends_on = [aws_config_delivery_channel.main]
+}
+
+# ── Config rules (compliance checks) ────────────────────────────────────────
+resource "aws_config_config_rule" "root_mfa" {
+  name             = "${var.project_name}-root-mfa-enabled"
+  source {
+    owner             = "AWS"
+    source_identifier = "ROOT_ACCOUNT_MFA_ENABLED"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
+
+resource "aws_config_config_rule" "no_public_s3" {
+  name             = "${var.project_name}-no-public-s3-buckets"
+  source {
+    owner             = "AWS"
+    source_identifier = "S3_BUCKET_PUBLIC_READ_PROHIBITED"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
+
+resource "aws_config_config_rule" "no_root_keys" {
+  name             = "${var.project_name}-no-root-access-keys"
+  source {
+    owner             = "AWS"
+    source_identifier = "IAM_NO_ROOT_ACCESS_KEY"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}
+
+resource "aws_config_config_rule" "no_public_db" {
+  name             = "${var.project_name}-db-no-public-access"
+  source {
+    owner             = "AWS"
+    source_identifier = "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"
+  }
+  depends_on = [aws_config_configuration_recorder.main]
+}

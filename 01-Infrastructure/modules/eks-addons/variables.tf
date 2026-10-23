@@ -87,3 +87,78 @@ variable "karpenter_interruption_queue_name" {
   EOT
   type    = string
 }
+
+# -------------------------------------------------------------------------
+# KEDA — event-driven autoscaling
+# -------------------------------------------------------------------------
+variable "enable_keda" {
+  description = "Enable KEDA operator (event-driven pod autoscaling on SQS/Kafka/metrics). Default true."
+  type        = bool
+  default     = true
+}
+
+variable "keda_role_arn" {
+  description = "IRSA role ARN for KEDA — grants sqs:GetQueueAttributes, cloudwatch:GetMetricData. Leave empty to skip IRSA (KEDA works but AWS triggers need manual SA annotation)."
+  type        = string
+  default     = ""
+}
+
+# -------------------------------------------------------------------------
+# Falco — runtime security monitoring
+# -------------------------------------------------------------------------
+variable "enable_falco" {
+  description = "Enable Falco (runtime security — detects anomalous container behavior via eBPF). Default true."
+  type        = bool
+  default     = true
+}
+
+variable "falco_sns_topic_arn" {
+  description = "SNS topic ARN for Falco alerts (same as CloudWatch alarm SNS → email + Slack). Leave empty to only send to CloudWatch Logs via Fluent Bit."
+  type        = string
+  default     = ""
+}
+
+# -------------------------------------------------------------------------
+# Goldilocks — cost optimization (pod right-sizing)
+# -------------------------------------------------------------------------
+variable "enable_goldilocks" {
+  description = "Enable Goldilocks (VPA recommendations dashboard — right-sizes pod CPU/memory). Default true."
+  type        = bool
+  default     = true
+}
+
+# -------------------------------------------------------------------------
+# Descheduler — pod rebalancing (cost optimization)
+# -------------------------------------------------------------------------
+variable "enable_descheduler" {
+  description = "Enable Descheduler (rebalances pods across nodes for better utilization). Default true."
+  type        = bool
+  default     = true
+}
+
+# -------------------------------------------------------------------------
+# Kubecost — cost allocation per namespace + per service
+# -------------------------------------------------------------------------
+variable "enable_kubecost" {
+  description = "Enable Kubecost (shows cost per namespace/service + savings recommendations). Default true."
+  type        = bool
+  default     = true
+}
+
+# -------------------------------------------------------------------------
+# Kubeshark — network traffic analysis (dev/debugging)
+# -------------------------------------------------------------------------
+variable "enable_kubeshark" {
+  description = "Enable Kubeshark (Wireshark for K8s — captures all pod network traffic). Default false — resource heavy, enable only for debugging."
+  type        = bool
+  default     = false
+}
+
+# -------------------------------------------------------------------------
+# Network Policies — pod-to-pod isolation
+# -------------------------------------------------------------------------
+variable "enable_network_policies" {
+  description = "Enable Calico + Network Policies (default-deny + allow rules per service). Default true for production."
+  type        = bool
+  default     = true
+}

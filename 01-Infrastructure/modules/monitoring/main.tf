@@ -870,3 +870,99 @@ resource "aws_dlm_lifecycle_policy" "ebs_snapshots" {
     Environment = var.environment
   }
 }
+
+# =============================================================================
+# CLOUDWATCH SYNTHETICS — external uptime monitoring (canary)
+# =============================================================================
+# WHY: CloudWatch and Prometheus monitor from INSIDE the cluster. If the ALB
+# is down, the cluster might still think everything is fine (pods are running,
+# metrics are normal — but no traffic can reach them).
+#
+# A canary runs OUTSIDE the cluster (in AWS managed infrastructure) and hits
+# the public URL every 5 minutes. If it gets a non-200 response or times out,
+# it fires an alarm → SNS → email + Slack.
+#
+# This catches:
+#   - ALB misconfiguration (listener rules wrong)
+#   - DNS failure (Route53 pointing to wrong ALB)
+#   - WAF blocking legitimate traffic
+#   - TLS certificate expiry causing browser errors
+#   - ALB deleted accidentally
+# =============================================================================
+resource "aws_synthetics_canary" "frontend_uptime" {
+  count                = var.external_alb_arn_suffix != "" ? 1 : 0
+  name                 = "${var.project_name}-frontend-uptime"
+  artifact_s3_location = "s3://${var.project_name}-waf-logs-${var.environment}/synthetics/"
+  execution_role_arn   = aws_iam_role.synthetics[0].arn
+  runtime_version      = "syn-1.0"
+  start_canary         = true
+
+  schedule {
+    expression = "rate(5 minutes)"
+  }
+
+  run_config {
+    timeout_in_seconds = 30
+  }
+
+  code {
+    zip_handler_bucket = aws_s3_bucket.synthetics_code[0].bucket
+    zip_handler_key    = aws_s3_object.synthetics_code[0].key
+  }
+
+  tags = {
+    Name        = "${var.project_name}-uptime-canary"
+    Environment = var.environment
+  }
+}
+
+# IAM role for the canary
+resource "aws_iam_role" "synthetics" {
+  count = var.external_alb_arn_suffix != "" ? 1 : 0
+  name  = "${var.project_name}-synthetics-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# Canary code — simple HTTP GET check
+# This is a simplified approach — in practice the code is uploaded as a zip
+# For production, pre-package the canary script and upload to S3
+resource "aws_s3_bucket" "synthetics_code" {
+  count  = var.external_alb_arn_suffix != "" ? 1 : 0
+  bucket = "${var.project_name}-synthetics-${var.environment}"
+}
+
+resource "aws_s3_object" "synthetics_code" {
+  count  = var.external_alb_arn_suffix != "" ? 1 : 0
+  bucket = aws_s3_bucket.synthetics_code[0].bucket
+  key    = "canary.zip"
+  # Placeholder — upload actual canary script before apply
+  source = "/dev/null"
+}
+
+# Alarm — canary failure
+resource "aws_cloudwatch_metric_alarm" "canary_failure" {
+  count               = var.external_alb_arn_suffix != "" ? 1 : 0
+  alarm_name          = "${var.project_name}-synthetics-canary-failure"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Failed"
+  namespace           = "CloudWatchSynthetics"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Frontend uptime canary is failing — site may be down from external perspective"
+  treat_missing_data  = "breaching"
+  alarm_actions       = local.alarm_actions
+  dimensions = {
+    CanaryName = "${var.project_name}-frontend-uptime"
+  }
+  tags = { Name = "${var.project_name}-canary-alarm", Environment = var.environment }
+}

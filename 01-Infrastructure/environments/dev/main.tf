@@ -133,6 +133,15 @@ module "eks_addons" {
   karpenter_node_role_name         = module.iam.node_role_name
   karpenter_interruption_queue_name = module.iam_irsa.karpenter_interruption_queue_name
 
+  # KEDA — event-driven autoscaling (SQS queue depth, CloudWatch metrics)
+  keda_role_arn = module.iam_irsa.keda_role_arn
+
+  # Falco — runtime security alerts go to the same SNS topic as CloudWatch alarms
+  falco_sns_topic_arn = module.messaging.sns_topic_arn
+
+  # KEDA + Falco + Goldilocks + Descheduler + Kubecost enabled by default.
+  # Kubeshark disabled (heavy, dev only). Override in dev.tfvars: enable_kubeshark = true
+
   depends_on = [module.eks, module.iam_irsa]
 }
 

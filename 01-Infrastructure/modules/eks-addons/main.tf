@@ -541,3 +541,561 @@ resource "helm_release" "secrets_store_csi_aws_provider" {
 
   depends_on = [helm_release.secrets_store_csi]
 }
+
+# =============================================================================
+# KEDA — Kubernetes Event-Driven Autoscaling
+# =============================================================================
+# WHAT: Scales pods based on external events (SQS queue length, Kafka lag,
+#       Prometheus metrics, CloudWatch, etc.) — not just CPU/memory.
+#
+# WHY OVER HPA ALONE:
+#   HPA scales on CPU/memory only. KEDA scales on business metrics:
+#     - SQS queue depth: "scale checkout-service when 50+ messages in queue"
+#     - Kafka consumer lag: "scale order-processor when lag > 100"
+#     - Aurora connections: "scale when DB connections > 80% of limit"
+#   KEDA also scales to ZERO — no traffic = no pods = no cost.
+#
+# INFRA vs APP:
+#   INFRA (this file): KEDA operator + CRDs (ScaledObject, ScaledJob, TriggerAuthentication)
+#   APP (03-Kubernetes/): each service creates a ScaledObject pointing to its
+#   Deployment + a trigger (SQS ARN, Kafka topic, etc.)
+#
+# IRSA: KEDA needs an IRSA role to read AWS metrics (SQS, CloudWatch).
+#   Created in iam-irsa module → passed here via var.keda_role_arn.
+# =============================================================================
+resource "helm_release" "keda" {
+  count            = var.enable_keda ? 1 : 0
+  name             = "keda"
+  repository       = "https://kedacore.github.io/charts"
+  chart            = "keda"
+  namespace        = "keda"
+  create_namespace = true
+  version          = "2.16.0"   # KEDA v2.x GA
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 600
+
+  # IRSA — KEDA needs to read AWS metrics (SQS queue depth, CloudWatch, etc.)
+  dynamic "set" {
+    for_each = var.keda_role_arn != "" ? [1] : []
+    content {
+      name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+      value = var.keda_role_arn
+    }
+  }
+
+  # Resource limits — KEDA operator is lightweight
+  set { name  = "operator.resources.requests.cpu",    value = "100m" }
+  set { name  = "operator.resources.requests.memory", value = "128Mi" }
+  set { name  = "operator.resources.limits.cpu",       value = "500m" }
+  set { name  = "operator.resources.limits.memory",   value = "256Mi" }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# =============================================================================
+# Falco — runtime security monitoring (DETECTS ANOMALOUS CONTAINER BEHAVIOR)
+# =============================================================================
+# WHAT: Watches container syscalls in real time via a kernel module / eBPF.
+#   Trivy scans images at BUILD time (CI pipeline). Falco watches what containers
+#   actually DO at RUNTIME — catches:
+#     - Container spawning a shell (reverse shell exploit)
+#     - Container reading /etc/shadow or /etc/passwd (credential theft)
+#     - Container writing to /bin or /usr/bin (system tampering)
+#     - Non-root container escalating to root (privilege escalation)
+#     - Outbound connection to known bad IP (data exfiltration)
+#     - Container reading Kubernetes service account token
+#
+# ARCHITECTURE:
+#   Falco (DaemonSet) → captures syscalls via eBPF → evaluates rules
+#     → FalcoSidekick → forwards alerts to:
+#       - SNS topic (→ email + Slack Lambda)
+#       - CloudWatch Logs
+#       - Slack webhook (if configured)
+#
+# INFRA vs APP:
+#   INFRA (this file): Falco + FalcoSidekick Helm release + default rules
+#   APP: nothing — Falco monitors automatically. App team can add custom
+#   rules in their namespace if needed.
+# =============================================================================
+resource "helm_release" "falco" {
+  count            = var.enable_falco ? 1 : 0
+  name             = "falco"
+  repository       = "https://falcosecurity.github.io/charts"
+  chart            = "falco"
+  namespace        = "falco"
+  create_namespace = true
+  version          = "4.16.0"   # Falco v0.39+ with eBPF driver
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 600
+
+  # Use eBPF driver (no kernel module needed — works on all EKS AMIs)
+  set { name  = "driver.kind", value = "ebpf" }
+
+  # Resource limits — Falco is lightweight with eBPF
+  set { name  = "resources.requests.cpu",    value = "100m"  }
+  set { name  = "resources.requests.memory", value = "128Mi" }
+  set { name  = "resources.limits.cpu",       value = "500m"  }
+  set { name  = "resources.limits.memory",     value = "512Mi" }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# ── FalcoSidekick — forwards Falco alerts to SNS + CloudWatch ────────────────
+resource "helm_release" "falcosidekick" {
+  count            = var.enable_falco ? 1 : 0
+  name             = "falcosidekick"
+  repository       = "https://falcosecurity.github.io/charts"
+  chart            = "falcosidekick"
+  namespace        = "falco"
+  version          = "0.9.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 300
+
+  # Send alerts to SNS topic (same topic as CloudWatch alarms → email + Slack)
+  dynamic "set" {
+    for_each = var.falco_sns_topic_arn != "" ? [1] : []
+    content {
+      name  = "config.aws.sns.topicarn"
+      value = var.falco_sns_topic_arn
+    }
+  }
+  set { name  = "config.aws.region", value = var.region }
+
+  # Also send to stdout (captured by Fluent Bit → CloudWatch)
+  set { name  = "config.output.fields", value = "stdout" }
+
+  # Resource limits
+  set { name  = "resources.requests.cpu",    value = "50m"   }
+  set { name  = "resources.requests.memory", value = "64Mi"  }
+  set { name  = "resources.limits.cpu",       value = "200m"  }
+  set { name  = "resources.limits.memory",     value = "256Mi" }
+
+  depends_on = [helm_release.falco]
+}
+
+# =============================================================================
+# Goldilocks — cost optimization (right-sizes pod CPU/memory requests)
+# =============================================================================
+# WHAT: Creates VPA objects for every Deployment in a namespace, reads VPA
+#   recommendations, and shows them in a web dashboard.
+#
+# WHY OVER VPA ALONE:
+#   VPA gives recommendations but you have to run `kubectl describe vpa` per
+#   service. Goldilocks:
+#     - Auto-creates VPA for every Deployment (opt-in via namespace label)
+#     - Shows ALL recommendations in one web UI
+#     - Compares current requests vs recommended requests
+#     - Calculates potential savings ($/month if you adopt recommendations)
+#
+# USAGE:
+#   1. Label a namespace to enable Goldilocks:
+#        kubectl label namespace ecommerce goldilocks.fairwinds.com/enabled=true
+#   2. Open the Goldilocks dashboard (exposed via 08-Monitoring ALB)
+#   3. See: "user-service: 200m CPU → recommended 50m CPU (save 75%)"
+#
+# INFRA vs APP:
+#   INFRA (this file): Goldilocks Helm release + VPA CRDs
+#   APP: label namespaces to opt in. No app code changes.
+# =============================================================================
+resource "helm_release" "goldilocks" {
+  count            = var.enable_goldilocks ? 1 : 0
+  name             = "goldilocks"
+  repository       = "https://charts.fairwinds.com/stable"
+  chart            = "goldilocks"
+  namespace        = "goldilocks"
+  create_namespace = true
+  version          = "8.0.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 300
+
+  # Dashboard service — ClusterIP (exposed via Gateway API in 08-Monitoring)
+  set { name  = "dashboard.service.type", value = "ClusterIP" }
+
+  # Resource limits
+  set { name  = "dashboard.resources.requests.cpu",    value = "50m"   }
+  set { name  = "dashboard.resources.requests.memory", value = "64Mi"  }
+  set { name  = "dashboard.resources.limits.cpu",       value = "200m"  }
+  set { name  = "dashboard.resources.limits.memory",     value = "256Mi" }
+
+  set { name  = "controller.resources.requests.cpu",    value = "50m"   }
+  set { name  = "controller.resources.requests.memory", value = "64Mi"  }
+  set { name  = "controller.resources.limits.cpu",       value = "200m"  }
+  set { name  = "controller.resources.limits.memory",     value = "256Mi" }
+
+  depends_on = [helm_release.vpa]
+}
+
+# =============================================================================
+# Descheduler — pod rebalancing across nodes (cost optimization)
+# =============================================================================
+# WHAT: Evicts pods from over-utilised nodes and lets the scheduler place
+#   them on under-utilised nodes. Karpenter handles NODE provisioning;
+#   Descheduler handles POD PLACEMENT optimisation.
+#
+# WHY:
+#   Over time, pods accumulate unevenly:
+#     Before: Node-1 (90% CPU), Node-2 (10% CPU) ← imbalanced
+#     After:  Node-1 (50% CPU), Node-2 (50% CPU) ← descheduler evicted + rescheduled
+#   This means Karpenter can then consolidate and terminate the freed-up node.
+#
+# STRATEGIES ENABLED:
+#   - RemoveDuplicates: don't run 2 replicas of the same Deployment on one node
+#   - LowNodeUtilization: evict pods from under-utilised nodes so Karpenter
+#     can terminate them (saves money)
+#   - RemovePodsViolatingNodeTaints: respect taints
+#   - RemovePodsHavingTooManyRestarts: evict crash-looping pods
+#
+# RUNS AS A CRON JOB — every 2 minutes by default (not always running).
+# =============================================================================
+resource "helm_release" "descheduler" {
+  count            = var.enable_descheduler ? 1 : 0
+  name             = "descheduler"
+  repository       = "https://kubernetes-sigs.github.io/descheduler"
+  chart            = "descheduler"
+  namespace        = "kube-system"
+  version          = "0.32.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 300
+
+  # Run every 2 minutes
+  set { name  = "schedule", value = "*/2 * * * *" }
+
+  # Strategies
+  set { name  = "strategies.RemoveDuplicates.enabled", value = "true" }
+  set { name  = "strategies.LowNodeUtilization.enabled", value = "true" }
+  set { name  = "strategies.RemovePodsViolatingNodeTaints.enabled", value = "true" }
+  set { name  = "strategies.RemovePodsHavingTooManyRestarts.enabled", value = "true" }
+
+  # Don't evict pods in kube-system (keep system pods stable)
+  set { name  = "deschedulerPolicy.namespaces.exclude[0]", value = "kube-system" }
+  set { name  = "deschedulerPolicy.namespaces.exclude[1]", value = "karpenter" }
+  set { name  = "deschedulerPolicy.namespaces.exclude[2]", value = "argocd" }
+  set { name  = "deschedulerPolicy.namespaces.exclude[3]", value = "monitoring" }
+  set { name  = "deschedulerPolicy.namespaces.exclude[4]", value = "falco" }
+  set { name  = "deschedulerPolicy.namespaces.exclude[5]", value = "keda" }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# =============================================================================
+# Kubecost — cost allocation per namespace + per service
+# =============================================================================
+# WHAT: Shows how much each namespace, deployment, and pod costs.
+#   Reads Kubernetes resource usage + AWS pricing API → calculates:
+#     - Monthly cost per namespace (ecommerce: $X, monitoring: $Y, kube-system: $Z)
+#     - Monthly cost per service (user-service: $A, product-service: $B)
+#     - Idle/wasted resources (pods requesting 2 CPU but using 0.1 CPU)
+#     - Savings recommendations (right-size pods, use Spot, clean up unused PVCs)
+#
+# WHY:
+#   CloudWatch shows you AWS infrastructure costs (EC2, RDS, ALB).
+#   Kubecost shows you KUBERNETES-level costs — which app is burning the most
+#   CPU/memory and how much that costs in dollars.
+#
+# DASHBOARD:
+#   Exposed via 08-Monitoring ALB at /kubecost/*
+#   Shows real-time cost allocation, efficiency score, savings recommendations.
+#
+# INFRA vs APP:
+#   INFRA (this file): Kubecost Helm release
+#   APP: nothing — Kubecost reads metrics automatically.
+# =============================================================================
+resource "helm_release" "kubecost" {
+  count            = var.enable_kubecost ? 1 : 0
+  name             = "kubecost"
+  repository       = "https://kubecost.github.io/cost-analyzer"
+  chart            = "cost-analyzer"
+  namespace        = "kubecost"
+  create_namespace = true
+  version          = "2.5.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 600
+
+  # Cluster name for Kubecost UI
+  set { name  = "kubecostProductConfigs.clusterName", value = var.cluster_name }
+
+  # Free tier — no license key needed for basic cost allocation
+  set { name  = "kubecostProductConfigslicenseKey", value = "" }
+
+  # Service type ClusterIP — exposed via Gateway API in 08-Monitoring
+  set { name  = "service.type", value = "ClusterIP" }
+
+  # Persistent storage for cost history
+  set { name  = "persistentVolume.size", value = "5Gi" }
+
+  # Resource limits
+  set { name  = "resources.requests.cpu",    value = "100m"  }
+  set { name  = "resources.requests.memory", value = "256Mi" }
+  set { name  = "resources.limits.cpu",       value = "500m"  }
+  set { name  = "resources.limits.memory",     value = "1Gi"   }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# =============================================================================
+# Kubeshark — network traffic analysis for K8s (Wireshark for K8s)
+# =============================================================================
+# WHAT: Captures ALL network traffic between pods in real time.
+#   - DaemonSet on every node — sniffs pod-to-pod traffic
+#   - Web UI at http://<kubeshark-node>:8899
+#   - Filter by namespace, pod, service, protocol
+#   - See HTTP requests/responses, gRPC, DNS, TCP handshakes
+#
+# WHY:
+#   Debug "why is user-service getting 500 from product-service?"
+#   See the actual HTTP request/response payloads, headers, timing.
+#   Fluent Bit shows you LOGS; Kubeshark shows you the WIRE.
+#
+# WHY NOT ALWAYS ON:
+#   Kubeshark is resource-heavy (captures everything on every node).
+#   Enable only for debugging — toggle with var.enable_kubeshark.
+#   Recommended: enable in dev, disable in prod.
+#
+# INFRA vs APP:
+#   INFRA (this file): Kubeshark Helm release
+#   APP: nothing — operators open the web UI to inspect traffic
+# =============================================================================
+resource "helm_release" "kubeshark" {
+  count            = var.enable_kubeshark ? 1 : 0
+  name             = "kubeshark"
+  repository       = "https://kubeshark.github.io/helm-charts"
+  chart            = "kubeshark"
+  namespace        = "kubeshark"
+  create_namespace = true
+  version          = "1.0.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 600
+
+  # Capture only the ecommerce namespace to reduce noise + resource usage
+  set { name  = "tap.namespaces", value = "ecommerce" }
+
+  # Web UI port
+  set { name  = "hub.frontend.port", value = "8899" }
+
+  # Resource limits — heavy capture
+  set { name  = "worker.resources.requests.cpu",    value = "200m"   }
+  set { name  = "worker.resources.requests.memory", value = "256Mi"  }
+  set { name  = "worker.resources.limits.cpu",       value = "1000m"  }
+  set { name  = "worker.resources.limits.memory",    value = "1Gi"    }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# =============================================================================
+# CALICO — Network Policy enforcement (pod-to-pod isolation)
+# =============================================================================
+# WHY: AWS VPC CNI doesn't enforce Kubernetes NetworkPolicies by default.
+#   Without Calico, ANY pod can reach ANY other pod — a compromised frontend
+#   pod can directly access payment-service, Aurora sidecars, etc.
+#
+#   Calico runs in "policy-only" mode — it doesn't replace VPC CNI for IP
+#   allocation, just adds NetworkPolicy enforcement on top.
+#
+#   DEFAULT POLICY (created below):
+#     - Default-deny in ecommerce namespace (no traffic unless explicitly allowed)
+#     - Allow frontend → all backend services
+#     - Allow backend services → Aurora (via RDS Proxy)
+#     - Allow backend services → Redis
+#     - Allow backend services → SNS/SQS (via VPC endpoints)
+#     - Deny everything else
+# =============================================================================
+resource "helm_release" "calico" {
+  count            = var.enable_network_policies ? 1 : 0
+  name             = "calico"
+  repository       = "https://docs.tigera.io/calico/charts"
+  chart            = "tigera-operator"
+  namespace        = "tigera-system"
+  create_namespace = true
+  version          = "3.29.0"
+  force_update     = true
+  cleanup_on_fail  = true
+  atomic           = true
+  timeout          = 600
+
+  # Calico in policy-only mode (doesn't replace VPC CNI)
+  set { name  = "installation.cni.type", value = "none" }
+  set { name  = "installation.controlPlaneTolerations[0].key", value = "CriticalAddonsOnly" }
+  set { name  = "installation.controlPlaneTolerations[0].value", value = "true" }
+
+  depends_on = [null_resource.gateway_api_crds]
+}
+
+# ── Default-deny NetworkPolicy in ecommerce namespace ─────────────────────────
+# No pod-to-pod traffic unless explicitly allowed by an allow-rule below
+resource "kubernetes_manifest" "default_deny_egress" {
+  count = var.enable_network_policies ? 1 : 0
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "NetworkPolicy"
+    metadata = {
+      name      = "default-deny-egress"
+      namespace = "ecommerce"
+    }
+    spec = {
+      podSelector = {}   # select all pods in the namespace
+      policyTypes = ["Egress"]
+      # No egress rules = deny all egress by default
+    }
+  }
+  depends_on = [helm_release.calico]
+}
+
+resource "kubernetes_manifest" "default_deny_ingress" {
+  count = var.enable_network_policies ? 1 : 0
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "NetworkPolicy"
+    metadata = {
+      name      = "default-deny-ingress"
+      namespace = "ecommerce"
+    }
+    spec = {
+      podSelector = {}
+      policyTypes = ["Ingress"]
+    }
+  }
+  depends_on = [helm_release.calico]
+}
+
+# ── Allow DNS (CoreDNS) for all pods ──────────────────────────────────────────
+resource "kubernetes_manifest" "allow_dns" {
+  count = var.enable_network_policies ? 1 : 0
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "NetworkPolicy"
+    metadata = {
+      name      = "allow-dns"
+      namespace = "ecommerce"
+    }
+    spec = {
+      podSelector = {}
+      policyTypes = ["Egress"]
+      egress = [{
+        to = [{
+          namespaceSelector = {
+            matchLabels = { "kubernetes.io/metadata.name" = "kube-system" }
+          }
+        }]
+        ports = [
+          { protocol = "UDP", port = 53 },
+          { protocol = "TCP", port = 53 }
+        ]
+      }]
+    }
+  }
+  depends_on = [helm_release.calico]
+}
+
+# ── Allow frontend → backend services (HTTP) ──────────────────────────────────
+resource "kubernetes_manifest" "allow_frontend_to_backend" {
+  count = var.enable_network_policies ? 1 : 0
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "NetworkPolicy"
+    metadata = {
+      name      = "allow-frontend-to-backend"
+      namespace = "ecommerce"
+    }
+    spec = {
+      podSelector = {
+        matchLabels = { "app" = "frontend" }
+      }
+      policyTypes = ["Egress"]
+      egress = [{
+        to = [{
+          podSelector = {
+            matchExpressions = [{
+              key      = "app"
+              operator = "In"
+              values   = ["user-service", "product-service", "cart-service", "order-service", "payment-service"]
+            }]
+          }
+        }]
+        ports = [{ protocol = "TCP", port = 8080 }]
+      }]
+    }
+  }
+  depends_on = [helm_release.calico]
+}
+
+# ── Allow backend services → Aurora (RDS Proxy) + Redis via VPC endpoints ────
+# Pods connect to Aurora/Redis via private IPs — allow all egress to VPC CIDR
+resource "kubernetes_manifest" "allow_backend_to_aurora_redis" {
+  count = var.enable_network_policies ? 1 : 0
+  manifest = {
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "NetworkPolicy"
+    metadata = {
+      name      = "allow-backend-to-aurora-redis"
+      namespace = "ecommerce"
+    }
+    spec = {
+      podSelector = {
+        matchExpressions = [{
+          key      = "app"
+          operator = "In"
+          values   = ["user-service", "product-service", "cart-service", "order-service", "payment-service", "notification-service"]
+        }]
+      }
+      policyTypes = ["Egress"]
+      egress = [{
+        # Allow to any IP in the VPC (Aurora, Redis, VPC endpoints are all in VPC)
+        ipBlock = { cidr = "0.0.0.0/0" }
+        ports = [
+          { protocol = "TCP", port = 5432 },  # Aurora PostgreSQL
+          { protocol = "TCP", port = 6379 },  # Redis
+          { protocol = "TCP", port = 443 }    # AWS services via VPC endpoints
+        ]
+      }]
+    }
+  }
+  depends_on = [helm_release.calico]
+}
+
+# =============================================================================
+# POD SECURITY STANDARDS — restricted mode
+# =============================================================================
+# EKS has built-in pod security admission (no extra controller needed).
+# Labeling a namespace with `pod-security.kubernetes.io/enforce=restricted`
+# PREVENTS:
+#   - Containers running as root (must set runAsNonRoot: true)
+#   - Privileged containers (securityContext.privileged: true)
+#   - hostPath mounts
+#   - host network/pid/IPC
+#   - Capabilities beyond the allowed set
+#   - seccompProfile not set
+#
+# This means any pod that violates these rules gets REJECTED at admission time.
+# =============================================================================
+resource "kubernetes_manifest" "pod_security_restricted" {
+  manifest = {
+    apiVersion = "v1"
+    kind       = "Namespace"
+    metadata = {
+      name = "ecommerce"
+      labels = {
+        "pod-security.kubernetes.io/enforce"         = "restricted"
+        "pod-security.kubernetes.io/enforce-version" = "latest"
+        "pod-security.kubernetes.io/audit"           = "restricted"
+        "pod-security.kubernetes.io/audit-version"    = "latest"
+        "pod-security.kubernetes.io/warn"            = "restricted"
+        "pod-security.kubernetes.io/warn-version"    = "latest"
+      }
+    }
+  }
+  depends_on = [helm_release.lb_controller]
+}

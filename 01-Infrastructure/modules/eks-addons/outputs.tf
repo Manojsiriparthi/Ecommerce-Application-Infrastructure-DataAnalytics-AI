@@ -77,3 +77,36 @@ output "karpenter_release_name" {
 
 # SQS queue + EventBridge rules are created in the iam-irsa module (single-apply design).
 # See iam_irsa outputs: karpenter_interruption_queue_name, karpenter_interruption_queue_arn
+
+# -------------------------------------------------------------------------
+# KEDA / Trivy Operator / Kubeshark
+# -------------------------------------------------------------------------
+output "keda_release_name" {
+  description = "KEDA Helm release name (event-driven autoscaling). Empty when disabled."
+  value       = var.enable_keda ? helm_release.keda[0].name : ""
+}
+
+output "falco_release_name" {
+  description = "Falco Helm release name (runtime security monitoring). Empty when disabled."
+  value       = var.enable_falco ? helm_release.falco[0].name : ""
+}
+
+output "goldilocks_release_name" {
+  description = "Goldilocks Helm release name (cost optimization — pod right-sizing). Empty when disabled."
+  value       = var.enable_goldilocks ? helm_release.goldilocks[0].name : ""
+}
+
+output "descheduler_release_name" {
+  description = "Descheduler Helm release name (pod rebalancing). Empty when disabled."
+  value       = var.enable_descheduler ? helm_release.descheduler[0].name : ""
+}
+
+output "kubecost_release_name" {
+  description = "Kubecost Helm release name (cost allocation per namespace). Empty when disabled."
+  value       = var.enable_kubecost ? helm_release.kubecost[0].name : ""
+}
+
+output "kubeshark_release_name" {
+  description = "Kubeshark Helm release name (network traffic analysis). Empty when disabled."
+  value       = var.enable_kubeshark ? helm_release.kubeshark[0].name : ""
+}

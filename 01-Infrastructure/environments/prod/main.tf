@@ -126,6 +126,15 @@ module "eks_addons" {
   karpenter_node_role_name          = module.iam.node_role_name
   karpenter_interruption_queue_name = module.iam_irsa.karpenter_interruption_queue_name
 
+  # KEDA — event-driven autoscaling
+  keda_role_arn = module.iam_irsa.keda_role_arn
+
+  # Falco — runtime security alerts to SNS
+  falco_sns_topic_arn = module.messaging.sns_topic_arn
+
+  # KEDA + Falco + Goldilocks + Descheduler + Kubecost enabled by default.
+  # Kubeshark disabled in prod.
+
   depends_on = [module.eks, module.iam_irsa]
 }
 
@@ -502,6 +511,12 @@ module "eks_addons_dr" {
   karpenter_role_arn                = module.iam_irsa_dr.karpenter_role_arn
   karpenter_node_role_name          = module.iam.node_role_name
   karpenter_interruption_queue_name = module.iam_irsa_dr.karpenter_interruption_queue_name
+
+  # KEDA DR
+  keda_role_arn = module.iam_irsa_dr.keda_role_arn
+
+  # Falco DR — alerts to DR region SNS (if separate) or primary SNS
+  falco_sns_topic_arn = module.messaging.sns_topic_arn
 
   depends_on = [module.eks_dr, module.iam_irsa_dr]
 }

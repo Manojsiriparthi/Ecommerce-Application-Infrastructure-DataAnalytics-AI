@@ -33,3 +33,9 @@ variable "database_subnets" {
   description = "Database subnet CIDRs"
   type        = list(string)
 }
+
+variable "aws_region" {
+  description = "AWS region — used for VPC endpoint service names"
+  type        = string
+  default     = "us-east-1"
+}
